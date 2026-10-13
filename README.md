@@ -59,4 +59,5 @@ pytest -v | cc-progress pipe --total 240 --label Tests --match 'PASSED|FAILED'
   (`CC_PROGRESS_STALE_HIDE`).
 - Updating commands exit 0 on operational errors so that progress reporting cannot break
   the job it reports on.
-- The task-list hook has been tested against synthetic hook input only.
+- `cc-progress doctor` checks the installation and reports when the status line last polled.
+- `CC_PROGRESS_HOOK_LOG=/path` in Claude Code's environment appends every hook payload there.

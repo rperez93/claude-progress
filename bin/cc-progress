@@ -27,6 +27,7 @@ cc-progress — progress bars with ETA for the Claude Code status line
   cc-progress pipe  [--total N] [--label TEXT] [--match REGEX] [--quiet]
                                                pass stdin through, one tick per (matching) line
   cc-progress show                             print the bars as the status line would
+  cc-progress doctor                           check the installation and whether the status line is polling
   cc-progress render                           status line entry point (session JSON on stdin)
   cc-progress hook                             hook entry point (hook JSON on stdin)
 
@@ -132,7 +133,7 @@ cmd_start() {
   [ "$HAS_LABEL" = 1 ] || LABEL=$ID
   mutate '{id: $id, label: $label, unit: $unit, total: $total, done: 0, state: "running",
            note: $note, mode: $mode, started_at: now, updated_at: now, finished_at: null,
-           samples: [[now, 0]], tasks: {created: 0, completed: [], deleted: []}}' \
+           samples: [[now, 0]], tasks: {created: 0, completed: [], deleted: [], subjects: {}}}' \
     --arg id "$ID" --arg label "$LABEL" --arg unit "$UNIT" --arg note "$NOTE" \
     --arg mode "$mode" --argjson total "$total"
 }
@@ -296,7 +297,37 @@ cmd_render() {
   [ -n "$sid" ] || sid=${CLAUDE_CODE_SESSION_ID:-}
   [[ $sid =~ ^[A-Za-z0-9_-]+$ ]] || return 0
   [ -n "${NO_COLOR:-}" ] && color=false
+  # stamp each poll so `doctor` can tell whether the status line is really refreshing
+  [ -d "$ROOT/$sid" ] && : > "$ROOT/$sid/.rendered" 2>/dev/null
   render_session "$sid" "$(cols)" "$color"
+}
+
+cmd_doctor() {
+  local settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" script interval bad=0 age
+  ok()  { printf 'ok    %s\n' "$*"; }
+  bad() { printf 'FAIL  %s\n' "$*"; bad=1; }
+  command -v jq >/dev/null && ok "jq present" || bad "jq missing"
+  command -v flock >/dev/null && ok "flock present" || bad "flock missing"
+  SID="${SID_OPT:-${CC_PROGRESS_SESSION:-${CLAUDE_CODE_SESSION_ID:-}}}"
+  [ -n "$SID" ] && ok "session id $SID" || bad "no session id (not inside Claude Code?)"
+  script=$(jq -r '.statusLine.command // empty' "$settings" 2>/dev/null); script=${script/#\~/$HOME}
+  if [ -f "$script" ] && grep -q 'CC-PROGRESS' "$script"; then ok "status line block in $script"
+  else bad "status line block missing — run install.sh"; fi
+  interval=$(jq -r '.statusLine.refreshInterval // empty' "$settings" 2>/dev/null)
+  [ -n "$interval" ] && ok "statusLine.refreshInterval = ${interval}s" \
+    || bad "statusLine.refreshInterval unset — the bar would only redraw when a message arrives"
+  jq -e '[.hooks.PostToolUse[]?.hooks[]?.command // "" | test("cc-progress")] | any' "$settings" >/dev/null 2>&1 \
+    && ok "task-list hook registered" || bad "task-list hook missing — run install.sh"
+  jq -e '[.hooks.SessionEnd[]?.hooks[]?.command // "" | test("cc-progress")] | any' "$settings" >/dev/null 2>&1 \
+    && ok "session-end cleanup hook registered" || bad "session-end hook missing — run install.sh"
+  if [ -n "$SID" ] && [ -e "$ROOT/$SID/.rendered" ]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$ROOT/$SID/.rendered") ))
+    if [ "$age" -le $(( ${interval:-2} * 3 + 2 )) ]; then ok "status line polled this session ${age}s ago"
+    else printf 'note  last status line poll for this session was %ss ago (normal if no bar has been active)\n' "$age"; fi
+  else
+    printf 'note  status line has not polled a bar in this session yet\n'
+  fi
+  return $bad
 }
 
 cmd_show() {
@@ -312,6 +343,7 @@ cmd_show() {
 cmd_hook() {
   local sid=${CLAUDE_CODE_SESSION_ID:-} input event f
   input=$(cat)
+  [ -n "${CC_PROGRESS_HOOK_LOG:-}" ] && printf '%s\n' "$input" >> "$CC_PROGRESS_HOOK_LOG"  # debugging aid
   if [ -z "$sid" ]; then sid=$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null); fi
   [[ $sid =~ ^[A-Za-z0-9_-]+$ ]] || return 0
   [ -d "$ROOT/$sid" ] || return 0
@@ -332,15 +364,18 @@ cmd_hook() {
           | .note = (($td | map(select(.status == "in_progress")) | .[0] | (.activeForm // .content)) // .note)
           | bump($td | map(select(.status == "completed")) | length)
         elif $t == "TaskCreate" then
-          .tasks.created += 1 | retotal | .updated_at = now
+          .tasks.created += 1
+          | (if ($h.tool_response.task.id? != null) and ($i.subject != null)
+             then .tasks.subjects[$h.tool_response.task.id | tostring] = $i.subject else . end)
+          | retotal | .updated_at = now
         elif $t == "TaskUpdate" and ($i.taskId != null) then
           ($i.taskId | tostring) as $k
           | (if $i.status == "completed" then .tasks.completed |= (. + [$k] | unique)
              elif $i.status == "deleted" then .tasks.deleted |= (. + [$k] | unique) | .tasks.completed -= [$k]
              elif $i.status == "in_progress" or $i.status == "pending" then
                .tasks.completed -= [$k]
-               | (if $i.status == "in_progress" and (($i.activeForm // $i.subject) != null)
-                  then .note = ($i.activeForm // $i.subject) else . end)
+               | (($i.activeForm // $i.subject // .tasks.subjects[$k]) as $what
+                  | if $i.status == "in_progress" and $what != null then .note = $what else . end)
              else . end)
           | retotal | bump(.tasks.completed | length)
         else . end' --argjson h "$input"
@@ -361,6 +396,7 @@ case "$CMD" in
   show)    cmd_show ;;
   render)  cmd_render ;;
   hook)    cmd_hook ;;
+  doctor)  cmd_doctor; exit $? ;;
   version|--version) echo "cc-progress $VERSION" ;;
   ""|help|-h|--help) usage ;;
   *)       die "unknown command '$CMD' (try: cc-progress help)" ;;

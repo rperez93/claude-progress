@@ -59,7 +59,10 @@ age '.state = "done" | .finished_at = now - 120'
 
 export CLAUDE_CODE_SESSION_ID=test
 "$P" start --tasks --label Plan
-for i in 1 2 3; do echo '{"hook_event_name":"PostToolUse","tool_name":"TaskCreate","tool_input":{}}' | "$P" hook; done
+# payload shapes below were captured from a real Claude Code 2.1.296 session
+for i in 1 2 3; do echo '{"hook_event_name":"PostToolUse","tool_name":"TaskCreate","tool_input":{"subject":"task '$i'"},"tool_response":{"task":{"id":"'$i'","subject":"task '$i'"}}}' | "$P" hook; done
+echo '{"hook_event_name":"PostToolUse","tool_name":"TaskUpdate","tool_input":{"taskId":"2","status":"in_progress"}}' | "$P" hook
+check "in-progress task named in note" "$("$P" show | grep Plan)" "task 2"
 echo '{"hook_event_name":"PostToolUse","tool_name":"TaskUpdate","tool_input":{"taskId":"1","status":"completed"}}' | "$P" hook
 echo '{"hook_event_name":"PostToolUse","tool_name":"TaskUpdate","tool_input":{"taskId":"1","status":"completed"}}' | "$P" hook
 check "task hook counts once" "$("$P" show | grep Plan)" "1/3"
