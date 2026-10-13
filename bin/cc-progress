@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# cc-progress — progress bars with ETA for the Claude Code status line.
+#
+# Writers (Claude, a loop, a hook) record progress in one small JSON file per
+# bar under $CC_PROGRESS_DIR/<session_id>/<bar_id>.json. The status line polls
+# those files on its refreshInterval and derives elapsed time and ETA at render
+# time, so the bar keeps moving while a single long command runs.
+set -u
+
+VERSION=0.1.0
+ROOT="${CC_PROGRESS_DIR:-$HOME/.claude/progress}"
+KEEP_DONE="${CC_PROGRESS_KEEP_DONE:-60}"       # seconds a finished bar stays visible
+STALE_HIDE="${CC_PROGRESS_STALE_HIDE:-7200}"   # seconds without an update before a running bar is hidden
+
+usage() {
+  cat <<'EOF'
+cc-progress — progress bars with ETA for the Claude Code status line
+
+  cc-progress start [--total N] [--label TEXT] [--unit WORD] [--note TEXT] [--tasks]
+  cc-progress tick  [N] [--note TEXT]          advance by N (default 1)
+  cc-progress set   DONE [--total N] [--note TEXT]
+  cc-progress total N                          correct the total mid-run
+  cc-progress note  TEXT                       what is being worked on now
+  cc-progress done  [--note TEXT]              mark finished (kept on screen briefly)
+  cc-progress fail  [--note TEXT]              mark failed
+  cc-progress clear [--all]                    remove the bar (or every bar of the session)
+  cc-progress pipe  [--total N] [--label TEXT] [--match REGEX] [--quiet]
+                                               pass stdin through, one tick per (matching) line
+  cc-progress show                             print the bars as the status line would
+  cc-progress render                           status line entry point (session JSON on stdin)
+  cc-progress hook                             hook entry point (hook JSON on stdin)
+
+Common options:
+  --id NAME        bar name, default "main"; use several names for several bars
+  --session ID     target session, default $CC_PROGRESS_SESSION or $CLAUDE_CODE_SESSION_ID
+
+Mutating commands never fail the calling job: on an operational error they warn
+on stderr and exit 0. Only a malformed invocation exits 2.
+EOF
+}
+
+die()  { printf 'cc-progress: %s\n' "$*" >&2; exit 2; }
+warn() { printf 'cc-progress: %s\n' "$*" >&2; }
+
+is_num() { [[ ${1:-} =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
+
+# ---------------------------------------------------------------- arguments
+CMD="${1:-}"; [ $# -gt 0 ] && shift
+ID=main SID_OPT="" TOTAL="" LABEL="" UNIT="" NOTE="" MATCH=""
+HAS_TOTAL=0 HAS_LABEL=0 HAS_NOTE=0 TASKS=0 ALL=0 QUIET=0
+POS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --id)       [ $# -ge 2 ] || die "--id needs a value";      ID=$2; shift 2 ;;
+    --session)  [ $# -ge 2 ] || die "--session needs a value"; SID_OPT=$2; shift 2 ;;
+    --total)    [ $# -ge 2 ] || die "--total needs a value";   TOTAL=$2; HAS_TOTAL=1; shift 2 ;;
+    --label)    [ $# -ge 2 ] || die "--label needs a value";   LABEL=$2; HAS_LABEL=1; shift 2 ;;
+    --unit)     [ $# -ge 2 ] || die "--unit needs a value";    UNIT=$2; shift 2 ;;
+    --note)     [ $# -ge 2 ] || die "--note needs a value";    NOTE=$2; HAS_NOTE=1; shift 2 ;;
+    --match)    [ $# -ge 2 ] || die "--match needs a value";   MATCH=$2; shift 2 ;;
+    --tasks)    TASKS=1; shift ;;
+    --all)      ALL=1; shift ;;
+    --quiet)    QUIET=1; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    --)         shift; POS+=("$@"); break ;;
+    *)          POS+=("$1"); shift ;;
+  esac
+done
+
+[[ $ID =~ ^[A-Za-z0-9_.-]+$ ]] || die "invalid --id '$ID' (letters, digits, _ . - only)"
+[ "$HAS_TOTAL" = 0 ] || is_num "$TOTAL" || die "--total must be a non-negative number"
+
+SID=""
+need_session() {
+  SID="${SID_OPT:-${CC_PROGRESS_SESSION:-${CLAUDE_CODE_SESSION_ID:-}}}"
+  [ -n "$SID" ] || die "no session id: pass --session or run inside Claude Code"
+  [[ $SID =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid session id '$SID'"
+}
+
+# ------------------------------------------------------------------- state
+JQ_LIB='
+def bump($d):
+  if $d != .done then
+    .done = $d
+    | .samples = (
+        if (.samples | length) > 1 and (now - .samples[-2][0]) < 1
+        then .samples[:-1] + [[now, $d]]
+        else .samples + [[now, $d]] end
+        | .[-30:])
+  else . end
+  | .updated_at = now;
+def need: if . == null then error("no such bar; run `cc-progress start` first") else . end;
+def running: .state = "running" | .finished_at = null;
+'
+
+# mutate FILTER [jq args...] — apply FILTER to the bar (null when absent), atomically.
+mutate() {
+  local filter=$1; shift
+  local dir="$ROOT/$SID" file tmp err rc
+  mkdir -p "$dir" 2>/dev/null || { warn "cannot create $dir"; return 0; }
+  file="$dir/$ID.json"
+  (
+    flock -w 5 9 || { warn "lock timeout on $dir"; exit 0; }
+    tmp=$(mktemp "$dir/.$ID.XXXXXX") || { warn "cannot write in $dir"; exit 0; }
+    if [ -s "$file" ]; then
+      err=$(jq -c "$@" "$JQ_LIB $filter" "$file" 2>&1 >"$tmp"); rc=$?
+    else
+      err=$(jq -nc "$@" "$JQ_LIB $filter" 2>&1 >"$tmp"); rc=$?
+    fi
+    if [ $rc -eq 0 ] && [ -s "$tmp" ]; then
+      mv -f "$tmp" "$file"
+    else
+      rm -f "$tmp"
+      warn "${err#jq: error (at *): }"
+    fi
+  ) 9>"$dir/.lock"
+  return 0
+}
+
+gc() { # drop session directories untouched for more than two days
+  [ -d "$ROOT" ] || return 0
+  find "$ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +2 -exec rm -rf {} + 2>/dev/null
+  return 0
+}
+
+cmd_start() {
+  need_session; gc
+  local total=null mode=manual
+  [ "$HAS_TOTAL" = 1 ] && total=$TOTAL
+  [ "$TASKS" = 1 ] && mode=tasks
+  [ "$TASKS" = 1 ] && [ "$ID" = main ] && ID=tasks
+  [ "$HAS_LABEL" = 1 ] || LABEL=$ID
+  mutate '{id: $id, label: $label, unit: $unit, total: $total, done: 0, state: "running",
+           note: $note, mode: $mode, started_at: now, updated_at: now, finished_at: null,
+           samples: [[now, 0]], tasks: {created: 0, completed: [], deleted: []}}' \
+    --arg id "$ID" --arg label "$LABEL" --arg unit "$UNIT" --arg note "$NOTE" \
+    --arg mode "$mode" --argjson total "$total"
+}
+
+cmd_tick() {
+  need_session
+  local n=${POS[0]:-1}
+  is_num "$n" || die "tick: N must be a non-negative number"
+  mutate 'need | running | bump(.done + $n) | if $hasnote then .note = $note else . end' \
+    --argjson n "$n" --arg note "$NOTE" --argjson hasnote "$HAS_NOTE"
+}
+
+cmd_set() {
+  need_session
+  local n=${POS[0]:-}
+  is_num "$n" || die "set: DONE must be a non-negative number"
+  local total=null; [ "$HAS_TOTAL" = 1 ] && total=$TOTAL
+  mutate 'need | running | (if $total != null then .total = $total else . end) | bump($n)
+          | if $hasnote then .note = $note else . end' \
+    --argjson n "$n" --argjson total "$total" --arg note "$NOTE" --argjson hasnote "$HAS_NOTE"
+}
+
+cmd_total() {
+  need_session
+  local n=${POS[0]:-}
+  is_num "$n" || die "total: N must be a non-negative number"
+  mutate 'need | .total = $n | .updated_at = now' --argjson n "$n"
+}
+
+cmd_note() {
+  need_session
+  [ ${#POS[@]} -gt 0 ] && NOTE="${POS[*]}"
+  mutate 'need | .note = $note | .updated_at = now' --arg note "$NOTE"
+}
+
+cmd_finish() { # $1 = done | error
+  need_session
+  mutate 'need | .state = $state | .finished_at = now | .updated_at = now
+          | if $hasnote then .note = $note else . end' \
+    --arg state "$1" --arg note "$NOTE" --argjson hasnote "$HAS_NOTE"
+}
+
+cmd_clear() {
+  need_session
+  if [ "$ALL" = 1 ]; then rm -rf "${ROOT:?}/$SID"; else rm -f "$ROOT/$SID/$ID.json"; fi
+}
+
+cmd_pipe() {
+  need_session
+  local own=0 pending=0 last=$SECONDS line
+  if [ "$HAS_TOTAL" = 1 ] || [ "$HAS_LABEL" = 1 ] || [ ! -s "$ROOT/$SID/$ID.json" ]; then
+    cmd_start; own=1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ "$QUIET" = 1 ] || printf '%s\n' "$line"
+    if [ -z "$MATCH" ] || [[ $line =~ $MATCH ]]; then pending=$((pending + 1)); fi
+    if [ "$pending" -gt 0 ] && [ "$SECONDS" != "$last" ]; then
+      POS=("$pending"); cmd_tick; pending=0; last=$SECONDS
+    fi
+  done
+  if [ "$pending" -gt 0 ]; then POS=("$pending"); cmd_tick; fi
+  [ "$own" = 1 ] && cmd_finish done
+  return 0
+}
+
+# ------------------------------------------------------------------ render
+JQ_RENDER='
+def rep($n): if $n <= 0 then "" else . * $n end;
+def pad2: tostring | if length < 2 then "0" + . else . end;
+def dur: (if . < 0 then 0 else . end | floor) as $s
+  | if $s < 60 then "\($s)s"
+    elif $s < 3600 then "\($s / 60 | floor)m\($s % 60 | pad2)s"
+    else "\($s / 3600 | floor)h\($s % 3600 / 60 | floor | pad2)m" end;
+def num: if . == floor then floor | tostring else (. * 10 | round / 10 | tostring) end;
+def c($code): if $color and length > 0 then "\u001b[\($code)m" + . + "\u001b[0m" else . end;
+def gauge($f; $w):
+  ($f * $w * 8 | floor) as $e | ($e / 8 | floor) as $full | ($e % 8) as $p
+  | (if $full >= $w or $p == 0 then "" else ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][$p] end) as $part
+  | (("█" | rep($full)) + $part | c("32")) + ("░" | rep($w - $full - ($part | length)) | c("2"));
+def line($now):
+  . as $b
+  | ($b.state == "running") as $run
+  | ((if $run then $now else ($b.finished_at // $b.updated_at) end) - $b.started_at) as $elapsed
+  | ($b.samples[0] // [$b.started_at, 0]) as $s0
+  | (if $run then
+       (if $b.done > $s0[1] and ($b.updated_at - $s0[0]) >= 1
+        then ($b.done - $s0[1]) / ($b.updated_at - $s0[0]) else null end)
+     else (if $b.done > 0 and $elapsed > 0 then $b.done / $elapsed else null end) end) as $rate
+  | ($b.total != null and $b.total > 0) as $bounded
+  | (if $run and $rate != null and $bounded and $b.done < $b.total
+     then [$b.updated_at + ($b.total - $b.done) / $rate - $now,
+           ($b.total - $b.done - 1) / $rate, 0] | max
+     else null end) as $eta
+  | ($now - $b.updated_at) as $idle
+  | ($run and $idle > ([120, (if $rate != null then 3 / $rate else 0 end)] | max)) as $stalled
+  | (if $b.unit != "" then " " + $b.unit else "" end) as $unit
+  | (if $run then "▶" elif $b.state == "done" then "✔" else "✘" end) as $icon
+  | (if $run then "32" elif $b.state == "done" then "1;32" else "1;31" end) as $tone
+  | ($b.label | if length > 32 then .[:31] + "…" else . end) as $label
+  | (if $cols > 0 and $cols < 80 then 10 else 20 end) as $w
+  | (if $bounded
+     then "\($b.done | num)/\($b.total | num)\($unit) \([$b.done / $b.total * 100, 100] | min | floor)%"
+     else "\($b.done | num)\($unit)" end) as $counts
+  | (if $run then ($elapsed | dur)
+     elif $b.state == "done" then "done in " + ($elapsed | dur)
+     else "failed after " + ($elapsed | dur) end) as $time
+  | (if $eta != null then
+       "ETA ~" + ($eta | dur)
+       + (if $eta >= 600 then " (" + ($now + $eta | strflocaltime("%H:%M")) + ")" else "" end)
+     elif $run and $bounded and $b.done < $b.total then "ETA …"
+     else "" end) as $etatxt
+  | (if $rate == null then ""
+     elif $rate >= 1 then "\($rate | num)/s"
+     elif 1 / $rate < 10 then "avg \(1 / $rate | num)s"
+     else "avg " + (1 / $rate | dur) end) as $ratetxt
+  | (if $stalled then "no update for " + ($idle | dur) else "" end) as $stalltxt
+  | ([$time, $etatxt, $ratetxt] | map(select(length > 0)) | join(" · ")) as $meta
+  | (2 + ($label | length) + (if $bounded then $w + 1 else 0 end) + 1 + ($counts | length)
+     + 3 + ($meta | length) + (if $stalled then 3 + ($stalltxt | length) else 0 end)) as $used
+  | ($b.note // "" | gsub("[\\n\\r\\t]"; " ")) as $rawnote
+  | (if $cols > 0 then $cols - $used - 4 else 60 end) as $room
+  | (if ($rawnote | length) == 0 or $room < 4 then ""
+     elif ($rawnote | length) > $room then $rawnote[:$room - 1] + "…"
+     else $rawnote end) as $note
+  | ($icon | c($tone)) + " " + ($label | c("1"))
+    + (if $bounded then " " + gauge([$b.done / $b.total, 1] | min; $w) else "" end)
+    + " " + $counts
+    + (" · " + $meta | c("2"))
+    + (if $stalled then (" · " | c("2")) + ($stalltxt | c("33")) else "" end)
+    + (if $note != "" then (" · " | c("2")) + $note else "" end);
+now as $now
+| map(select(type == "object" and has("started_at")))
+# a bar that reached its total counts as finished even if `done` was never called
+| map(if .state == "running" and .total != null and .total > 0 and .done >= .total
+      then .state = "done" | .finished_at = .updated_at else . end)
+| map(select(
+    (.state == "running" and ($now - .updated_at) < $stalehide)
+    or (.state != "running" and ($now - (.finished_at // .updated_at)) < $keep)))
+| sort_by(.started_at)
+| .[] | line($now)
+'
+
+render_session() { # SID COLS COLOR
+  local files
+  shopt -s nullglob
+  files=("$ROOT/$1"/*.json)
+  shopt -u nullglob
+  [ ${#files[@]} -gt 0 ] || return 0
+  jq -rs --argjson cols "$2" --argjson color "$3" \
+     --argjson keep "$KEEP_DONE" --argjson stalehide "$STALE_HIDE" \
+     "$JQ_RENDER" "${files[@]}" 2>/dev/null
+  return 0
+}
+
+cols() { local c=${COLUMNS:-0}; [[ $c =~ ^[0-9]+$ ]] || c=0; printf '%s' "$c"; }
+
+cmd_render() {
+  local input sid color=true
+  input=$(cat)
+  sid=$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null)
+  [ -n "$sid" ] || sid=${CLAUDE_CODE_SESSION_ID:-}
+  [[ $sid =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+  [ -n "${NO_COLOR:-}" ] && color=false
+  render_session "$sid" "$(cols)" "$color"
+}
+
+cmd_show() {
+  need_session
+  local color=false
+  [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && color=true
+  render_session "$SID" "$(cols)" "$color"
+}
+
+# -------------------------------------------------------------------- hook
+# PostToolUse on TaskCreate|TaskUpdate|TodoWrite keeps a `--tasks` bar in step
+# with Claude's own task list; SessionEnd removes the session's bars.
+cmd_hook() {
+  local sid=${CLAUDE_CODE_SESSION_ID:-} input event f
+  input=$(cat)
+  if [ -z "$sid" ]; then sid=$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null); fi
+  [[ $sid =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+  [ -d "$ROOT/$sid" ] || return 0
+  event=$(jq -r '.hook_event_name // empty' <<<"$input" 2>/dev/null)
+  if [ "$event" = SessionEnd ]; then rm -rf "${ROOT:?}/$sid"; return 0; fi
+  [ "$event" = PostToolUse ] || return 0
+  SID=$sid
+  for f in "$ROOT/$sid"/*.json; do
+    [ -e "$f" ] || continue
+    grep -q '"mode":"tasks"' "$f" && grep -q '"state":"running"' "$f" || continue
+    ID=$(basename "$f" .json)
+    mutate '
+      def retotal: .total = ([.tasks.created - (.tasks.deleted | length), (.tasks.completed | length)] | max);
+      ($h.tool_name // "") as $t | ($h.tool_input // {}) as $i
+      | if $t == "TodoWrite" then
+          ($i.todos // []) as $td
+          | .total = ($td | length)
+          | .note = (($td | map(select(.status == "in_progress")) | .[0] | (.activeForm // .content)) // .note)
+          | bump($td | map(select(.status == "completed")) | length)
+        elif $t == "TaskCreate" then
+          .tasks.created += 1 | retotal | .updated_at = now
+        elif $t == "TaskUpdate" and ($i.taskId != null) then
+          ($i.taskId | tostring) as $k
+          | (if $i.status == "completed" then .tasks.completed |= (. + [$k] | unique)
+             elif $i.status == "deleted" then .tasks.deleted |= (. + [$k] | unique) | .tasks.completed -= [$k]
+             elif $i.status == "in_progress" or $i.status == "pending" then
+               .tasks.completed -= [$k]
+               | (if $i.status == "in_progress" and (($i.activeForm // $i.subject) != null)
+                  then .note = ($i.activeForm // $i.subject) else . end)
+             else . end)
+          | retotal | bump(.tasks.completed | length)
+        else . end' --argjson h "$input"
+  done
+  return 0
+}
+
+case "$CMD" in
+  start)   cmd_start ;;
+  tick)    cmd_tick ;;
+  set)     cmd_set ;;
+  total)   cmd_total ;;
+  note)    cmd_note ;;
+  done)    cmd_finish done ;;
+  fail)    cmd_finish error ;;
+  clear)   cmd_clear ;;
+  pipe)    cmd_pipe ;;
+  show)    cmd_show ;;
+  render)  cmd_render ;;
+  hook)    cmd_hook ;;
+  version|--version) echo "cc-progress $VERSION" ;;
+  ""|help|-h|--help) usage ;;
+  *)       die "unknown command '$CMD' (try: cc-progress help)" ;;
+esac
+exit 0
