@@ -23,8 +23,11 @@ check "elapsed"              "$out" "1m00s"
 check "eta = 30 left x 6s"   "$out" "ETA ~3m00s"
 check "average"              "$out" "avg 6s"
 
-age '.started_at -= 30 | .samples[0][0] -= 30 | .updated_at -= 30'
-check "eta counts down between ticks" "$("$P" show)" "ETA ~2m30s"
+age '.started_at -= 4 | .samples[0][0] -= 4 | .updated_at -= 4'
+check "eta counts down between ticks" "$("$P" show)" "ETA ~2m56s"
+
+age '.started_at -= 26 | .samples[0][0] -= 26 | .updated_at -= 26'
+check "overrunning item floors eta at the rest" "$("$P" show)" "ETA ~2m54s"
 
 age '.updated_at -= 600'
 check "stall is flagged"     "$("$P" show)" "no update for"
