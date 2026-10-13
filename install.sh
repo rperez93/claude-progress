@@ -2,6 +2,7 @@
 # Install (or with --uninstall, remove) cc-progress for Claude Code:
 #   - the CLI          -> ~/.local/bin/cc-progress            (symlink)
 #   - the skill        -> ~/.claude/skills/progress-bar       (symlink)
+#   - the rule         -> ~/.claude/rules/progress-bar.md     (symlink, loaded every session)
 #   - a managed block  -> the statusLine command script
 #   - two hooks        -> ~/.claude/settings.json (PostToolUse task tools, SessionEnd)
 # Idempotent. settings.json and the status line script are backed up before any change.
@@ -12,6 +13,7 @@ CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 BIN_DIR="${CC_PROGRESS_BIN_DIR:-$HOME/.local/bin}"
 SETTINGS="$CLAUDE_DIR/settings.json"
 SKILL_LINK="$CLAUDE_DIR/skills/progress-bar"
+RULE_LINK="$CLAUDE_DIR/rules/progress-bar.md"
 BEGIN='# >>> CC-PROGRESS (managed by claude-progress install.sh) — do not edit by hand'
 END='# <<< CC-PROGRESS'
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -80,17 +82,20 @@ if [ "$MODE" = uninstall ]; then
   fi
   [ -f "$SETTINGS" ] && write_settings "$settings_without_hooks"
   [ -L "$SKILL_LINK" ] && rm -f "$SKILL_LINK"
+  [ -L "$RULE_LINK" ] && rm -f "$RULE_LINK"
   [ -L "$BIN_DIR/cc-progress" ] && rm -f "$BIN_DIR/cc-progress"
   echo "cc-progress removed (state under $CLAUDE_DIR/progress left in place)"
   exit 0
 fi
 
-mkdir -p "$BIN_DIR" "$CLAUDE_DIR/skills"
+mkdir -p "$BIN_DIR" "$CLAUDE_DIR/skills" "$CLAUDE_DIR/rules"
 chmod +x "$REPO/bin/cc-progress"
 ln -sfn "$REPO/bin/cc-progress" "$BIN_DIR/cc-progress"
 ln -sfn "$REPO/skill" "$SKILL_LINK"
 echo "cli: $BIN_DIR/cc-progress -> $REPO/bin/cc-progress"
+ln -sfn "$REPO/rules/progress-bar.md" "$RULE_LINK"
 echo "skill: $SKILL_LINK -> $REPO/skill"
+echo "rule: $RULE_LINK -> $REPO/rules/progress-bar.md"
 
 [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
 script=$(statusline_script)

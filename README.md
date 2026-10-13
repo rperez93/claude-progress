@@ -21,7 +21,8 @@ Progress bars with count, elapsed time and ETA in the Claude Code status line.
   session shows only its own bars.
 - **A hook** keeps a `--tasks` bar in step with Claude's task list (PostToolUse on
   `TaskCreate|TaskUpdate|TodoWrite`) and removes a session's bars on `SessionEnd`.
-- **A skill** (`progress-bar`) tells Claude when and how to use it: count first, tick as a
+- **A skill** (`progress-bar`) and a one-paragraph rule in `~/.claude/rules/` (loaded every
+  session) tell Claude when and how to use it: count first, tick as a
   side effect of the work, always finish.
 
 ## Install
