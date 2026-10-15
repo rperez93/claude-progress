@@ -19,7 +19,7 @@ jobs:
           jq --version
           flock --version | head -1
       - name: Syntax
-        run: bash -n bin/cc-progress install.sh tests/run.sh
+        run: bash -n cc_progress/bin/cc-progress cc_progress/install.sh install.sh tests/run.sh
       - name: Suite
         run: tests/run.sh
       - name: Suite under a C locale
