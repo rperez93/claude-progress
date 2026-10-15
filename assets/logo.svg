@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="cc-progress logo: a braille spinner, a gauge filled past its fifth cell, and a rule beneath">
+  <rect x="0" y="0" width="256" height="256" rx="56" fill="#0f172a"/>
+  <!-- the spinner frame: a 2x4 braille cell, four dots lit -->
+  <g fill="#67e8f9">
+    <circle cx="52" cy="66" r="6"/>
+    <circle cx="52" cy="86" r="6"/>
+    <circle cx="72" cy="86" r="6"/>
+    <circle cx="72" cy="106" r="6"/>
+  </g>
+  <g fill="#334155" opacity="0.9">
+    <circle cx="72" cy="66" r="6"/>
+    <circle cx="52" cy="106" r="6"/>
+    <circle cx="52" cy="126" r="6"/>
+    <circle cx="72" cy="126" r="6"/>
+  </g>
+  <!-- the gauge: eight cells, five full, the sixth five eighths full -->
+  <g>
+    <rect x="96"  y="66" width="14" height="60" rx="3" fill="#3ddc97"/>
+    <rect x="114" y="66" width="14" height="60" rx="3" fill="#3ddc97"/>
+    <rect x="132" y="66" width="14" height="60" rx="3" fill="#3ddc97"/>
+    <rect x="150" y="66" width="14" height="60" rx="3" fill="#3ddc97"/>
+    <rect x="168" y="66" width="14" height="60" rx="3" fill="#3ddc97"/>
+    <rect x="186" y="66" width="14" height="60" rx="3" fill="#334155"/>
+    <rect x="186" y="66" width="9"  height="60" rx="3" fill="#3ddc97"/>
+    <rect x="204" y="66" width="14" height="60" rx="3" fill="#334155"/>
+  </g>
+  <!-- the rule that closes the block -->
+  <rect x="52" y="154" width="166" height="4" rx="2" fill="#475569"/>
+  <!-- the figures beneath, as quiet marks: elapsed, ETA -->
+  <g fill="#94a3b8">
+    <rect x="52"  y="178" width="34" height="8" rx="4"/>
+    <rect x="96"  y="178" width="58" height="8" rx="4"/>
+    <rect x="164" y="178" width="22" height="8" rx="4"/>
+  </g>
+</svg>

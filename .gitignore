@@ -1,0 +1,7 @@
+# local working notes for agents, deliberately not shared
+CLAUDE.md
+AGENTS.md
+# editor and OS noise
+.idea/
+.vscode/
+.DS_Store

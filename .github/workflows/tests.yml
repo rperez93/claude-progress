@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions
+        run: |
+          bash --version | head -1
+          jq --version
+          flock --version | head -1
+      - name: Syntax
+        run: bash -n bin/cc-progress install.sh tests/run.sh
+      - name: Suite
+        run: tests/run.sh
+      - name: Suite under a C locale
+        run: LANG=C LC_ALL=C tests/run.sh
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Build the wheel and install it into a clean venv
+        run: |
+          python -m pip install build
+          python -m build
+          python -m venv /tmp/v && /tmp/v/bin/pip install dist/*.whl
+          /tmp/v/bin/cc-progress version
+          CLAUDE_CONFIG_DIR=/tmp/cfg /tmp/v/bin/cc-progress install --create-statusline
+          CLAUDE_CONFIG_DIR=/tmp/cfg CLAUDE_CODE_SESSION_ID=ci /tmp/v/bin/cc-progress doctor

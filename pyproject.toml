@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cc-progress"
+version = "0.5.0"
+description = "Progress bars with count, elapsed time and ETA in the Claude Code status line."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Rafael Pérez" }]
+keywords = ["claude-code", "status-line", "progress-bar", "eta", "cli", "coding-agents"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Unix Shell",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: User Interfaces",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/rperez93/claude-progress"
+Repository = "https://github.com/rperez93/claude-progress"
+Issues = "https://github.com/rperez93/claude-progress/issues"
+Changelog = "https://github.com/rperez93/claude-progress/releases"
+
+[project.scripts]
+cc-progress = "cc_progress:main"
+
+[tool.setuptools]
+packages = ["cc_progress"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+cc_progress = ["bin/cc-progress", "install.sh", "skill/*", "rules/*"]

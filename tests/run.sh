@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Self-contained checks for cc-progress. Usage: tests/run.sh
 set -u
-P="${CC_PROGRESS_BIN:-$(cd "$(dirname "$0")/.." && pwd)/bin/cc-progress}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+P="${CC_PROGRESS_BIN:-$ROOT/cc_progress/bin/cc-progress}"
 export CC_PROGRESS_DIR; CC_PROGRESS_DIR=$(mktemp -d)
 export CC_PROGRESS_SESSION=test COLUMNS=140 NO_COLOR=1
 trap 'rm -rf "$CC_PROGRESS_DIR"' EXIT
@@ -11,6 +12,12 @@ check() { # NAME HAYSTACK NEEDLE
   if [[ $2 == *"$3"* ]]; then echo "ok   $1"; else echo "FAIL $1: expected '$3' in: $2"; fails=$((fails + 1)); fi
 }
 age() { jq -c "$1" "$F" > "$F.n" && mv "$F.n" "$F"; }
+
+v_cli=$(grep -m1 '^VERSION=' "$ROOT/cc_progress/bin/cc-progress" | cut -d= -f2)
+v_py=$(grep -m1 '^version = ' "$ROOT/pyproject.toml" | cut -d'"' -f2)
+v_mod=$(grep -m1 '^__version__ = ' "$ROOT/cc_progress/__init__.py" | cut -d'"' -f2)
+check "one version everywhere ($v_cli)" "$v_py/$v_mod" "$v_cli/$v_cli"
+check "version command"      "$("$P" version)" "cc-progress $v_cli"
 
 "$P" start --total 40 --label Converting --unit files
 check "fresh bar"            "$("$P" show)" "0/40 files 0%"
