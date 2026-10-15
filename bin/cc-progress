@@ -302,7 +302,7 @@ def line($now; $labelw):
   . as $b
   | ($b.state == "running") as $run
   | ((if $run then $now else ($b.finished_at // $b.updated_at) end) - $b.started_at) as $elapsed
-  | ($b.weights // {} | length > 0) as $weighted
+  | ($b.weights // {} | length > 0 and (($b.weights | add) > 0)) as $weighted   # all-zero weights: unweighted
   | (if $weighted then ($b.weights | add) else $b.total end) as $wtotal
   | ($b.wdone // $b.done) as $wdone
   | ($b.samples[0] // [$b.started_at, 0, 0]) as $s0
@@ -312,7 +312,7 @@ def line($now; $labelw):
   | (if $run then
        (if $wgained > 0 and ($last[0] - $s0[0]) >= 1 then $wgained / ($last[0] - $s0[0]) else null end)
      else (if $wgained > 0 and $elapsed > 0 then $wgained / $elapsed else null end) end) as $rate
-  | ($b.total != null and $b.total > 0) as $bounded
+  | ($b.total != null and $b.total > 0 and $wtotal > 0) as $bounded
   | (if $bounded then $wtotal - $wdone else 0 end) as $left
   # the current item: its weight if the note names a weighted item, else the mean weight
   | (if $weighted then ($b.weights[$b.note // ""] // (($b.weights | add) / ($b.weights | length))) else 1 end) as $wcur
@@ -380,7 +380,8 @@ now as $now
     or (.state != "running" and ($now - (.finished_at // .updated_at)) < $keep)))
 | sort_by(.started_at)
 | (map(.label | clean | length) | max // 0 | if . > 32 then 32 else . end) as $labelw
-| [.[] | line($now; $labelw)]
+# one corrupt file degrades one line, never the whole block
+| [.[] | . as $b | try line($now; $labelw) catch ((G.bad | c("1;31")) + " " + ($b.label // $b.id // "?" | tostring | clean) + " cannot be rendered")]
 # a rule after the bars, as wide as the widest bar, so the rows above read as one
 # block (progress) and the rows below as another (the usual status line)
 | if length == 0 or ($divider | not) then .[]
