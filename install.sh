@@ -4,7 +4,8 @@
 #   - the skill        -> ~/.claude/skills/progress-bar       (symlink)
 #   - the rule         -> ~/.claude/rules/progress-bar.md     (symlink, loaded every session)
 #   - a managed block  -> the statusLine command script
-#   - two hooks        -> ~/.claude/settings.json (PostToolUse task tools, SessionEnd)
+#   - hooks            -> ~/.claude/settings.json (task tools, task events, subagent events, SessionEnd)
+#   - statusLine.refreshInterval = 1 when unset (the spinner and countdown redraw once a second)
 # Idempotent. settings.json and the status line script are backed up before any change.
 set -euo pipefail
 
@@ -106,12 +107,19 @@ else
 fi
 
 write_settings "$settings_without_hooks"'
-  | .hooks.PostToolUse = ((.hooks.PostToolUse // []) + [{matcher: "TaskCreate|TaskUpdate|TodoWrite", hooks: [{type: "command", command: $cmd, timeout: 5}]}])
-  | .hooks.SessionEnd  = ((.hooks.SessionEnd  // []) + [{hooks: [{type: "command", command: $cmd, timeout: 5}]}])
+  | .hooks.PostToolUse   = ((.hooks.PostToolUse   // []) + [{matcher: "TaskCreate|TaskUpdate|TodoWrite", hooks: [{type: "command", command: $cmd, timeout: 5}]}])
+  | .hooks.TaskCreated   = ((.hooks.TaskCreated   // []) + [{hooks: [{type: "command", command: $cmd, timeout: 5}]}])
+  | .hooks.TaskCompleted = ((.hooks.TaskCompleted // []) + [{hooks: [{type: "command", command: $cmd, timeout: 5}]}])
+  | .hooks.SubagentStart = ((.hooks.SubagentStart // []) + [{hooks: [{type: "command", command: $cmd, timeout: 5}]}])
+  | .hooks.SubagentStop  = ((.hooks.SubagentStop  // []) + [{hooks: [{type: "command", command: $cmd, timeout: 5}]}])
+  | .hooks.SessionEnd    = ((.hooks.SessionEnd    // []) + [{hooks: [{type: "command", command: $cmd, timeout: 5}]}])
+  | if .statusLine.refreshInterval == null and .statusLine.command != null then .statusLine.refreshInterval = 1 else . end
 '
 
 interval=$(jq -r '.statusLine.refreshInterval // empty' "$SETTINGS")
 if [ -z "$interval" ]; then
-  echo "note: statusLine.refreshInterval is not set — without it the bar only redraws when a message arrives. Set it to 1–5 seconds." >&2
+  echo "note: statusLine.refreshInterval is not set (no statusLine command?) — without it the bar only redraws when a message arrives." >&2
+elif [ "$interval" -gt 1 ] 2>/dev/null; then
+  echo "note: statusLine.refreshInterval is ${interval}s; 1 s gives a smooth spinner and a live countdown (cc-progress render itself takes ~10 ms)." >&2
 fi
 echo "done. Try: cc-progress start --total 10 --label Demo && cc-progress tick 3"

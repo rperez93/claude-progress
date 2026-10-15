@@ -17,12 +17,21 @@ pipe the output through `pipe`, or let the task hook count for you. Do not rely 
 running `cc-progress set` by hand after each step unless the steps are genuinely
 separate tool calls.
 
-## 1. Count first
+## 1. Count work, then count first
 
-An ETA needs a total. Before starting, measure it (`ls | wc -l`, `wc -l < list`,
-`jq length`, number of test files, rows to migrate). If it truly cannot be known,
-start without `--total`: the bar shows count, elapsed and rate, and no ETA —
-which is the honest display. Correct it later with `cc-progress total N`.
+An ETA is on work, so the unit must be work of roughly even cost. Before choosing
+`--unit`, ask whether the items are alike: tests, rows, pages, requests usually
+are; files, tasks, steps and modules usually are not. Either count the fine unit
+(tests, not test files), or keep the coarse unit and pass each item's cost with
+`--weights FILE` (`WEIGHT NAME` per line, the shape `wc -l` prints, or a JSON
+object), then `cc-progress note NAME` before an item and `cc-progress tick --item
+NAME` after it. The count stays in items; the gauge, the percentage and the ETA
+are on the weights. For a pytest sweep: `grep -c 'def test_' "$f"` per file.
+
+Then measure the total before starting (`ls | wc -l`, `wc -l < list`, `jq length`,
+rows to migrate). If it truly cannot be known, start without `--total`: the bar
+shows count, elapsed and a sweeping block, and no ETA — which is the honest
+display. Correct it later with `cc-progress total N`.
 
 ## 2. Pick the channel
 
@@ -60,11 +69,15 @@ cc-progress start --total 100 --label "Training" --unit %
 cc-progress set "$pct" --note "epoch $e loss $loss"
 ```
 
+**Subagents** — `cc-progress start --agents --label "Reviewers"` *before* launching
+them. Hooks count every agent that starts and finishes (total = started, done =
+finished, note = the types still running). Nothing to remember, nothing in context.
+
 **Multi-step work you do yourself across tool calls** — two options:
 
 - With the task list: `cc-progress start --tasks --label "Refactor"` *before*
-  creating the tasks. A hook then counts TaskCreate / TaskUpdate (or TodoWrite)
-  calls: total = tasks created, done = tasks completed. Nothing to remember.
+  creating the tasks. Hooks then count task creation and completion: total = tasks
+  created, done = tasks completed. Nothing to remember.
 - Without it: `cc-progress start --total 6 --label "Migration" --unit steps`,
   then chain the tick onto the command that completes each step
   (`... && cc-progress tick --note "step 3: backfill"`), so it cannot be skipped.
@@ -97,8 +110,9 @@ the default is `main`.
 ## Reference
 
 ```
-cc-progress start [--total N] [--done N] [--label TEXT] [--unit WORD] [--note TEXT] [--tasks]
-cc-progress tick  [N] [--note TEXT]
+cc-progress start [--total N] [--done N] [--label TEXT] [--unit WORD] [--note TEXT]
+                  [--weights FILE] [--tasks] [--agents]
+cc-progress tick  [N] [--item NAME] [--note TEXT]
 cc-progress set   DONE [--total N] [--note TEXT]
 cc-progress total N
 cc-progress note  TEXT

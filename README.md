@@ -3,15 +3,25 @@
 Progress bars with count, elapsed time and ETA in the Claude Code status line.
 
 ```
-⠹ Converting ██████▌░░░░░░░░░░░░░ 13/40 files 32% · 1m18s · ETA ~2m42s → 14:07 · 6s/file · report-q3.pdf
-⠹ Sweep      ████████████████▌░░░ 19/23 files 82% · 13m01s · ETA ≥2m03s → 14:09 · 41s/file · test_rules_sweep.py (11m30s)
-✔ Tests      240/240 tests 100% · done in 4m02s · 1s/test
+⠸ Converting ██████▌░░░░░░░░░░░░░ 13/40 files 32%  1m18s · ETA ~2m35s at 12:39 · 5.9s/file  › report-q3.pdf
+⠸ Sweep      ████████████████▌░░░ 19/23 files 82%  13m01s · ETA ≥2m03s at 14:09  › test_rules_sweep.py 11m30s
+⠸ Scanning   ░░░░░▓▓▓░░░░░░░░░░░░ 1200 rows  40s
+✔ Tests      ████████████████████ 240/240 tests 100%  done in 4m02s · 1s/test
+✘ Deploy     ██████▋░░░░░░░░░░░░░ 2/6 steps 33%  failed after 12s  › step 3: migrate
 ```
 
-The braille spinner advances once per status line poll, so a bar that is not moving is
-visibly still being watched. `ETA ~` is an estimate on schedule; `ETA ≥` means the current
-item is already past the average and the figure is a floor, with the time spent on that
-item shown after its name. The finish time of day is shown once the ETA reaches a minute.
+One line per bar, read left to right in the order the questions come: is it alive (the
+spinner advances once per second), how far (the gauge, the only coloured block), the count,
+then the quiet figures: elapsed, ETA, rate, and after `›` what is being worked on now.
+`ETA ~` is on schedule; `ETA ≥` means the current item is already past the average, the
+figure is a floor, and the time spent on that item follows its name in amber. The finish
+time of day appears once the ETA reaches a minute. A bar without a total shows a block
+sweeping back and forth instead of a fill.
+
+Colours are the terminal's own ANSI roles (green, cyan, yellow, red, bright black, bold),
+never fixed RGB values, so the bar follows whatever theme the terminal uses. Set
+`CC_PROGRESS_MUTED=2` if the theme's bright black is unreadable (faint is used instead), or
+`NO_COLOR=1` for plain text.
 
 ## How it works
 
@@ -25,8 +35,12 @@ item shown after its name. The finish time of day is shown once the ETA reaches 
 - **The session** comes from `$CLAUDE_CODE_SESSION_ID` on the write side and `session_id`
   in the status line's stdin on the read side. Subagents share the parent's id. Each
   session shows only its own bars.
-- **A hook** keeps a `--tasks` bar in step with Claude's task list (PostToolUse on
-  `TaskCreate|TaskUpdate|TodoWrite`) and removes a session's bars on `SessionEnd`.
+- **Hooks** keep a `--tasks` bar in step with Claude's task list (PostToolUse on
+  `TaskCreate|TaskUpdate|TodoWrite`, plus the `TaskCreated`/`TaskCompleted` events), keep an
+  `--agents` bar in step with subagents (`SubagentStart`/`SubagentStop`: total = agents
+  started, done = agents finished, note = the types still running), and remove a session's
+  bars on `SessionEnd`. Each hook is a few milliseconds of jq on a local file; nothing is
+  sent to the model and nothing interrupts the conversation.
 - **A skill** (`progress-bar`) and a one-paragraph rule in `~/.claude/rules/` (loaded every
   session) tell Claude when and how to use it: count first, tick as a
   side effect of the work, always finish.
@@ -40,7 +54,9 @@ tests/run.sh
 ```
 
 Requires `jq`, `flock`, bash, and a `statusLine` of type `command` pointing at a script.
-Set `statusLine.refreshInterval` (1–5 s) or the bar only redraws when a message arrives.
+`statusLine.refreshInterval` is set to 1 s when unset; without it the bar only redraws when
+a message arrives, and at 1 s the spinner and the countdown move every second. The whole
+render is about 10 ms.
 
 ## Usage
 
@@ -50,6 +66,33 @@ while IFS= read -r f; do convert "$f"; cc-progress tick --note "$f"; done < file
 cc-progress done
 
 pytest -v | cc-progress pipe --total 240 --label Tests --match 'PASSED|FAILED'
+```
+
+### Count work, not items
+
+The ETA is only as good as the unit. Files, tasks or steps of very unequal size make the
+bar lie: a test sweep with 22 quick files and one of 32 minutes shows 95 % for most of the
+run. Pick the smallest countable thing of roughly even cost (tests, rows, pages), or keep
+the coarse unit for the count and give the bar the cost of each item:
+
+```bash
+for f in tests/test_*.py; do echo "$(grep -c 'def test_' "$f") $f"; done > weights.txt
+cc-progress start --label "Tests" --unit files --weights weights.txt
+for f in tests/test_*.py; do
+  cc-progress note "$f"                 # the ETA now expects this file's cost
+  pytest -q "$f"; cc-progress tick --item "$f"
+done
+cc-progress done
+```
+
+The count still reads `3/23 files`; the gauge, the percentage and the ETA are on tests.
+`--weights` takes `WEIGHT NAME` lines (the shape `wc -l` prints) or a JSON object.
+
+### Agents and tasks, hands free
+
+```bash
+cc-progress start --agents --label "Reviewers"   # then launch the agents
+cc-progress start --tasks  --label "Refactor"    # then create the tasks
 ```
 
 `cc-progress help` lists every command; `skill/SKILL.md` has the patterns.

@@ -16,7 +16,7 @@ age() { jq -c "$1" "$F" > "$F.n" && mv "$F.n" "$F"; }
 check "fresh bar"            "$("$P" show)" "0/40 files 0%"
 check "no ETA before data"   "$("$P" show)" "ETA …"
 
-age '.started_at -= 60 | .samples = [[.started_at, 0], [now, 10]] | .done = 10 | .updated_at = now'
+age '.started_at -= 60 | .samples = [[.started_at, 0, 0], [now, 10, 10]] | .done = 10 | .wdone = 10 | .updated_at = now'
 out=$("$P" show)
 check "count and percent"    "$out" "10/40 files 25%"
 check "elapsed"              "$out" "1m00s"
@@ -33,7 +33,7 @@ age '.started_at -= 26 | .samples[] |= (.[0] -= 26)'
 out=$("$P" show)
 check "overdue item: eta is a floor" "$out" "ETA ≥"
 check "overdue item: in-flight time counted (10 in 90s, 29 left)" "$out" "ETA ≥4m21s"
-check "overdue item: time on the current item shown" "$out" "same value (30s)"
+check "overdue item: time on the current item shown" "$out" "same value 30s"
 
 age '.updated_at -= 600'
 check "stall is flagged"     "$("$P" show)" "no update for"
@@ -54,6 +54,27 @@ check "start --done" "$(jq -c '[.done, .samples[0][1]]' "$CC_PROGRESS_DIR/test/p
 
 "$P" start --id free --label Scanning --unit rows; "$P" set 1200 --id free
 check "no total, no ETA"     "$("$P" show | grep Scanning)" "1200 rows"
+check "no total: scanner"    "$("$P" show | grep Scanning)" "▓▓▓"
+
+# weighted items: three files, 1 + 1 + 8 tests; the ETA is on tests, not on files
+printf '1 a.py\n1 b.py\n8 c.py\n' > "$CC_PROGRESS_DIR/w.txt"
+"$P" start --id w --label Weighted --unit files --weights "$CC_PROGRESS_DIR/w.txt"
+check "weights set the total"  "$(jq -c '[.total, (.weights | add)]' "$CC_PROGRESS_DIR/test/w.json")" "[3,10]"
+"$P" tick --id w --item a.py --note b.py
+check "one light item = 10%"   "$("$P" show | grep Weighted)" "1/3 files 10%"
+WF="$CC_PROGRESS_DIR/test/w.json"
+jq -c '.started_at -= 30 | .samples[0][0] -= 30 | .samples[1][0] -= 20' "$WF" > "$WF.n" && mv "$WF.n" "$WF"
+"$P" tick --id w --item b.py --note c.py
+jq -c '.started_at -= 10 | .samples[] |= (.[0] -= 10)' "$WF" > "$WF.n" && mv "$WF.n" "$WF"
+out=$("$P" show | grep Weighted)
+check "two light items = 20%"  "$out" "2/3 files 20%"
+check "eta on the heavy item: 8 tests x 15s, 10s in" "$out" "ETA ~1m50s"
+check "weighted bar shows no per-file rate" "$(printf '%s' "$out" | grep -c '/file')" "0"
+"$P" done --id w
+check "done fills the weighted gauge" "$("$P" show | grep Weighted)" "100%"
+printf '{"a.py": 2, "b.py": 3}' > "$CC_PROGRESS_DIR/w.json"
+"$P" start --id wj --weights "$CC_PROGRESS_DIR/w.json"
+check "weights as JSON"        "$(jq -c '.weights' "$CC_PROGRESS_DIR/test/wj.json")" '{"a.py":2,"b.py":3}'
 [[ $("$P" show | grep Scanning) == *ETA* ]] && { echo "FAIL indeterminate bar shows ETA"; fails=$((fails + 1)); }
 
 "$P" start --id par --total 300; seq 300 | xargs -P 16 -I{} "$P" tick --id par
@@ -80,6 +101,21 @@ echo '{"hook_event_name":"PostToolUse","tool_name":"TaskUpdate","tool_input":{"t
 echo '{"hook_event_name":"PostToolUse","tool_name":"TaskUpdate","tool_input":{"taskId":"1","status":"completed"}}' | "$P" hook
 check "task hook counts once" "$("$P" show | grep Plan)" "1/3"
 check "render via stdin json" "$(echo '{"session_id":"test"}' | "$P" render | grep Plan)" "1/3"
+"$P" start --agents --label Agents
+# payload shapes captured from a real Claude Code 2.1.300 session
+echo '{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"general-purpose"}' | "$P" hook
+echo '{"hook_event_name":"SubagentStart","agent_id":"a2","agent_type":"Explore"}' | "$P" hook
+check "agents: two started"   "$("$P" show | grep Agents)" "0/2"
+check "agents: running types in note" "$("$P" show | grep Agents)" "Explore, general-purpose"
+echo '{"hook_event_name":"SubagentStop","agent_id":"a1","agent_type":"general-purpose"}' | "$P" hook
+check "agents: one finished"  "$("$P" show | grep Agents)" "1/2"
+check "agents: finished one leaves the note" "$("$P" show | grep Agents | grep -c general-purpose)" "0"
+echo '{"hook_event_name":"TaskCreated","task_id":"9","task_subject":"late task"}' | "$P" hook
+check "TaskCreated counted once with TaskCreate" "$("$P" show | grep Plan)" "1/4"
+echo '{"hook_event_name":"TaskCompleted","task_id":"9"}' | "$P" hook
+check "TaskCompleted counted"  "$("$P" show | grep Plan)" "2/4"
+echo '{"hook_event_name":"TaskCompleted","task_id":"9"}' | "$P" hook
+check "TaskCompleted idempotent" "$("$P" show | grep Plan)" "2/4"
 echo '{"hook_event_name":"SessionEnd"}' | "$P" hook
 check "session end cleans up" "$(ls "$CC_PROGRESS_DIR")" ""
 

@@ -7,22 +7,29 @@
 # time, so the bar keeps moving while a single long command runs.
 set -u
 
-VERSION=0.2.0
+VERSION=0.3.0
 ROOT="${CC_PROGRESS_DIR:-$HOME/.claude/progress}"
 KEEP_DONE="${CC_PROGRESS_KEEP_DONE:-60}"       # seconds a finished bar stays visible
 STALE_HIDE="${CC_PROGRESS_STALE_HIDE:-7200}"   # seconds without an update before a running bar is hidden
+MUTED="${CC_PROGRESS_MUTED:-90}"               # SGR code for secondary text: 90 = the theme's bright black, 2 = faint
 
 usage() {
   cat <<'EOF'
 cc-progress — progress bars with ETA for the Claude Code status line
 
-  cc-progress start [--total N] [--done N] [--label TEXT] [--unit WORD] [--note TEXT] [--tasks]
+  cc-progress start [--total N] [--done N] [--label TEXT] [--unit WORD] [--note TEXT]
+                    [--weights FILE] [--tasks] [--agents]
                                                --done: units already finished before the bar
                                                started (shown, but not counted into the rate)
-  cc-progress tick  [N] [--note TEXT]          advance by N (default 1)
+                                               --weights: "WEIGHT NAME" per line (wc -l style) or a
+                                               JSON object; the ETA is then on work, not on items
+                                               --tasks / --agents: follow the task list / subagents
+  cc-progress tick  [N] [--item NAME] [--note TEXT]
+                                               advance by N (default 1); --item credits NAME's weight
   cc-progress set   DONE [--total N] [--note TEXT]
   cc-progress total N                          correct the total mid-run
-  cc-progress note  TEXT                       what is being worked on now
+  cc-progress note  TEXT                       what is being worked on now (a weighted item name
+                                               lets the ETA expect that item's cost)
   cc-progress done  [--note TEXT]              mark finished (kept on screen briefly)
   cc-progress fail  [--note TEXT]              mark failed
   cc-progress clear [--all]                    remove the bar (or every bar of the session)
@@ -49,8 +56,8 @@ is_num() { [[ ${1:-} =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 
 # ---------------------------------------------------------------- arguments
 CMD="${1:-}"; [ $# -gt 0 ] && shift
-ID=main SID_OPT="" TOTAL="" LABEL="" UNIT="" NOTE="" MATCH="" DONE0=0
-HAS_TOTAL=0 HAS_LABEL=0 HAS_NOTE=0 TASKS=0 ALL=0 QUIET=0
+ID=main SID_OPT="" TOTAL="" LABEL="" UNIT="" NOTE="" MATCH="" DONE0=0 WEIGHTS="" ITEM=""
+HAS_TOTAL=0 HAS_LABEL=0 HAS_NOTE=0 TASKS=0 AGENTS=0 ALL=0 QUIET=0
 POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -63,6 +70,9 @@ while [ $# -gt 0 ]; do
     --note)     [ $# -ge 2 ] || die "--note needs a value";    NOTE=$2; HAS_NOTE=1; shift 2 ;;
     --match)    [ $# -ge 2 ] || die "--match needs a value";   MATCH=$2; shift 2 ;;
     --tasks)    TASKS=1; shift ;;
+    --agents)   AGENTS=1; shift ;;
+    --weights)  [ $# -ge 2 ] || die "--weights needs a value"; WEIGHTS=$2; shift 2 ;;
+    --item)     [ $# -ge 2 ] || die "--item needs a value";    ITEM=$2; shift 2 ;;
     --all)      ALL=1; shift ;;
     --quiet)    QUIET=1; shift ;;
     -h|--help)  usage; exit 0 ;;
@@ -88,21 +98,25 @@ JQ_LIB='
 # ETA from. updated_at is only a heartbeat (the writer is alive); a `set` to the
 # same value, a `note` or a `total` never add a sample, so they cannot move the
 # ETA anchor or inflate the rate.
-def bump($d):
+# samples are [time, done, weighted_done]; weighted_done equals done when the bar has no weights.
+def wmean: if (.weights | length) > 0 then ((.weights | add) / (.weights | length)) else 1 end;
+def bump($d; $w):
   if $d != .done then
-    .done = $d
+    .done = $d | .wdone = $w
     | .samples = (
         # a jump of more than one unit within 2 s of start is work that was finished
         # before the bar existed: make it the baseline, do not count it as rate
         if (.samples | length) == 1 and (now - .samples[0][0]) < 2 and ($d - .samples[0][1]) > 1
-        then [[now, $d]]
+        then [[now, $d, $w]]
         # bursts: keep at most one sample per second, the first sample never moves
         elif (.samples | length) > 1 and (now - .samples[-2][0]) < 1
-        then .samples[:-1] + [[now, $d]]
-        else .samples + [[now, $d]] end
+        then .samples[:-1] + [[now, $d, $w]]
+        else .samples + [[now, $d, $w]] end
         | .[-30:])
   else . end
   | .updated_at = now;
+# unweighted advance: weighted progress moves by the mean weight per unit
+def bump($d): bump($d; (.wdone // .done) + ($d - .done) * wmean);
 def need: if . == null then error("no such bar; run `cc-progress start` first") else . end;
 def running: .state = "running" | .finished_at = null;
 '
@@ -139,24 +153,39 @@ gc() { # drop session directories untouched for more than two days
 
 cmd_start() {
   need_session; gc
-  local total=null mode=manual
+  local total=null mode=manual weights='{}'
   [ "$HAS_TOTAL" = 1 ] && total=$TOTAL
   [ "$TASKS" = 1 ] && mode=tasks
-  [ "$TASKS" = 1 ] && [ "$ID" = main ] && ID=tasks
+  [ "$AGENTS" = 1 ] && mode=agents
+  [ "$ID" = main ] && [ "$mode" != manual ] && ID=$mode
   [ "$HAS_LABEL" = 1 ] || LABEL=$ID
+  if [ -n "$WEIGHTS" ]; then
+    [ -r "$WEIGHTS" ] || die "--weights: cannot read $WEIGHTS"
+    weights=$(jq -c 'if type == "object" then map_values(tonumber) else error("x") end' "$WEIGHTS" 2>/dev/null) \
+      || weights=$(awk 'NF >= 2 && $1 ~ /^[0-9.]+$/ { w = $1; $1 = ""; sub(/^ +/, ""); printf "%s%s\t%s", (n++ ? "\n" : ""), w, $0 }' "$WEIGHTS" \
+                   | jq -Rsc 'split("\n") | map(select(length > 0) | split("\t") | {key: .[1], value: (.[0] | tonumber)}) | from_entries')
+    [ -n "$weights" ] && [ "$weights" != "{}" ] || die "--weights: no \"WEIGHT NAME\" lines or JSON object in $WEIGHTS"
+    [ "$HAS_TOTAL" = 1 ] || total=$(jq 'length' <<<"$weights")
+  fi
   mutate '{id: $id, label: $label, unit: $unit, total: $total, done: $done0, state: "running",
            note: $note, mode: $mode, started_at: now, updated_at: now, finished_at: null,
-           samples: [[now, $done0]], tasks: {created: 0, completed: [], deleted: [], subjects: {}}}' \
+           weights: $weights, wdone: null, samples: [], credited: [],
+           tasks: {created: 0, completed: [], deleted: [], subjects: {}}}
+          | .wdone = $done0 * wmean | .samples = [[now, $done0, .wdone]]' \
     --arg id "$ID" --arg label "$LABEL" --arg unit "$UNIT" --arg note "$NOTE" \
-    --arg mode "$mode" --argjson total "$total" --argjson done0 "$DONE0"
+    --arg mode "$mode" --argjson total "$total" --argjson done0 "$DONE0" --argjson weights "$weights"
 }
 
 cmd_tick() {
   need_session
   local n=${POS[0]:-1}
   is_num "$n" || die "tick: N must be a non-negative number"
-  mutate 'need | running | bump(.done + $n) | if $hasnote then .note = $note else . end' \
-    --argjson n "$n" --arg note "$NOTE" --argjson hasnote "$HAS_NOTE"
+  mutate 'need | running
+          | if $item != "" and (.weights[$item] != null) then
+              bump(.done + $n; (.wdone // .done) + .weights[$item]) | .credited += [$item]
+            else bump(.done + $n) end
+          | if $hasnote then .note = $note else . end' \
+    --argjson n "$n" --arg note "$NOTE" --argjson hasnote "$HAS_NOTE" --arg item "$ITEM"
 }
 
 cmd_set() {
@@ -185,6 +214,7 @@ cmd_note() {
 cmd_finish() { # $1 = done | error
   need_session
   mutate 'need | .state = $state | .finished_at = now | .updated_at = now
+          | if $state == "done" and (.weights | length) > 0 then .wdone = (.weights | add) else . end
           | if $hasnote then .note = $note else . end' \
     --arg state "$1" --arg note "$NOTE" --argjson hasnote "$HAS_NOTE"
 }
@@ -221,87 +251,103 @@ def dur: (if . < 0 then 0 else . end | floor) as $s
     elif $s < 3600 then "\($s / 60 | floor)m\($s % 60 | pad2)s"
     else "\($s / 3600 | floor)h\($s % 3600 / 60 | floor | pad2)m" end;
 def num: if . == floor then floor | tostring else (. * 10 | round / 10 | tostring) end;
+# Colours are the 16 ANSI roles only (green, yellow, red, cyan, bright black, bold),
+# so the terminal theme decides what they look like; nothing is hard-coded.
 def c($code): if $color and length > 0 then "\u001b[\($code)m" + . + "\u001b[0m" else . end;
+def muted: c($muted);
 def padr($n): length as $l | . + (" " | rep($n - $l));
 def singular: if test("s$") and length > 1 then .[:-1] else . end;
 def gauge($f; $w; $tone):
   ($f * $w * 8 | floor) as $e | ($e / 8 | floor) as $full | ($e % 8) as $p
   | (if $full >= $w or $p == 0 then "" else ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][$p] end) as $part
-  | (("█" | rep($full)) + $part | c($tone)) + ("░" | rep($w - $full - ($part | length)) | c("2"));
-# One frame per status line poll (2 s): proves the display is live even when nothing moves.
-def spinner($now): ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][($now / 2 | floor) % 10];
+  | (("█" | rep($full)) + $part | c($tone)) + ("░" | rep($w - $full - ($part | length)) | muted);
+# no total: a block sweeping back and forth, one cell per poll
+def scanner($now; $w; $tone):
+  (($w - 3) * 2) as $period | (($now | floor) % $period) as $i
+  | (if $i < $w - 2 then $i else $period - $i end) as $pos
+  | ("░" | rep($pos) | muted) + ("▓▓▓" | c($tone)) + ("░" | rep($w - 3 - $pos) | muted);
+# one frame per poll (refreshInterval 1 s): a bar that is not moving is visibly still watched
+def spinner($now): ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][($now | floor) % 10];
 def line($now; $labelw):
   . as $b
   | ($b.state == "running") as $run
   | ((if $run then $now else ($b.finished_at // $b.updated_at) end) - $b.started_at) as $elapsed
-  | ($b.samples[0] // [$b.started_at, 0]) as $s0
+  | ($b.weights // {} | length > 0) as $weighted
+  | (if $weighted then ($b.weights | add) else $b.total end) as $wtotal
+  | ($b.wdone // $b.done) as $wdone
+  | ($b.samples[0] // [$b.started_at, 0, 0]) as $s0
   | ($b.samples[-1] // $s0) as $last                 # last real progress, not the last heartbeat
   | ($b.done - $s0[1]) as $gained                    # units completed while the bar was watching
+  | ($wdone - ($s0[2] // $s0[1])) as $wgained         # the same, in work units
   | (if $run then
-       (if $gained > 0 and ($last[0] - $s0[0]) >= 1 then $gained / ($last[0] - $s0[0]) else null end)
-     else (if $gained > 0 and $elapsed > 0 then $gained / $elapsed else null end) end) as $rate
+       (if $wgained > 0 and ($last[0] - $s0[0]) >= 1 then $wgained / ($last[0] - $s0[0]) else null end)
+     else (if $wgained > 0 and $elapsed > 0 then $wgained / $elapsed else null end) end) as $rate
   | ($b.total != null and $b.total > 0) as $bounded
-  | (if $bounded then $b.total - $b.done else 0 end) as $left
-  # the current unit is expected to finish 1/rate after the last one; while it is
+  | (if $bounded then $wtotal - $wdone else 0 end) as $left
+  # the current item: its weight if the note names a weighted item, else the mean weight
+  | (if $weighted then ($b.weights[$b.note // ""] // (($b.weights | add) / ($b.weights | length))) else 1 end) as $wcur
+  # the current unit is expected to finish wcur/rate after the last one; while it is
   # overdue the ETA floors at what the rest will take, and is shown as "≥"
   | (if $run and $rate != null and $bounded and $left > 0
-     then ($last[0] + 1 / $rate - $now) else null end) as $next
+     then ($last[0] + $wcur / $rate - $now) else null end) as $next
   | ($next != null and $next < 0) as $overdue
-  # once overdue, the average per unit counts the unit in flight (as tqdm does), so a
-  # workload of unequal items pushes the estimate out instead of pretending
-  | (if $overdue then $gained / ($now - $s0[0]) else $rate end) as $rate
-  | (if $next != null then ([$next, 0] | max) + ($left - 1) / $rate else null end) as $eta
+  # once overdue, the average counts the unit in flight (as tqdm does), so a workload
+  # of unequal items pushes the estimate out instead of pretending
+  | (if $overdue then $wgained / ($now - $s0[0]) else $rate end) as $rate
+  | (if $next != null then ([$next, 0] | max) + ([$left - $wcur, 0] | max) / $rate else null end) as $eta
   | ($now - $b.updated_at) as $idle
-  | ($run and $idle > ([120, (if $rate != null then 3 / $rate else 0 end)] | max)) as $stalled
+  | ($run and $idle > ([120, (if $rate != null then 3 * $wcur / $rate else 0 end)] | max)) as $stalled
   | (if $b.unit != "" then " " + $b.unit else "" end) as $unit
   | (if $run then (if $stalled then "▶" else spinner($now) end) elif $b.state == "done" then "✔" else "✘" end) as $icon
   | (if $run then (if $stalled then "33" else "36" end) elif $b.state == "done" then "1;32" else "1;31" end) as $tone
   | (if $run then "32" elif $b.state == "done" then "32" else "31" end) as $fill
   | ($b.label | if length > 32 then .[:31] + "…" else . end | padr($labelw)) as $label
   | (if $cols > 0 and $cols < 80 then 10 else 20 end) as $w
-  | (if $bounded
-     then "\($b.done | num)/\($b.total | num)\($unit) " + ("\([$b.done / $b.total * 100, 100] | min | floor)%" | c("1"))
+  | (if $bounded then "\([$wdone / $wtotal * 100, 100] | min | floor)%" else "" end) as $pct
+  | (if $bounded then "\($b.done | num)/\($b.total | num)\($unit) " + ($pct | c("1"))
      else "\($b.done | num)\($unit)" end) as $counts
   | (if $run then ($elapsed | dur)
      elif $b.state == "done" then "done in " + ($elapsed | dur)
      else "failed after " + ($elapsed | dur) end) as $time
   | (if $eta != null then
        "ETA " + (if $overdue then "≥" else "~" end) + ($eta | dur)
-       + (if $eta >= 60 then " → " + ($now + $eta | strflocaltime("%H:%M")) else "" end)
+       + (if $eta >= 60 then " at " + ($now + $eta | strflocaltime("%H:%M")) else "" end)
      elif $run and $bounded and $left > 0 then "ETA …"
      else "" end) as $etatxt
-  | (if $rate == null then ""
+  | (if $rate == null or $weighted then ""
      elif $rate >= 1 then "\($rate | num)/s"
      else (1 / $rate | if . < 10 then num + "s" else dur end)
           + (if $b.unit != "" then "/" + ($b.unit | singular) else " each" end) end) as $ratetxt
   | (if $stalled then "no update for " + ($idle | dur) else "" end) as $stalltxt
   | ([$time, $etatxt, $ratetxt] | map(select(length > 0)) | join(" · ")) as $meta
   | ($b.note // "" | gsub("[\\n\\r\\t]"; " ") | gsub("^ +| +$"; "")) as $rawnote
-  | (if $overdue and ($rawnote | length) > 0 then " (" + ($now - $last[0] | dur) + ")" else "" end) as $onit
+  | (if $overdue and ($rawnote | length) > 0 then " " + ($now - $last[0] | dur) else "" end) as $onit
   | (2 + ($label | length) + (if $bounded then $w + 1 else 0 end) + 1 + ($counts | length)
-     + 3 + ($meta | length) + (if $stalled then 3 + ($stalltxt | length) else 0 end) + ($onit | length)) as $used
-  | (if $cols > 0 then $cols - $used - 4 else 60 end) as $room
+     + 2 + ($meta | length) + (if $stalled then 3 + ($stalltxt | length) else 0 end) + ($onit | length)) as $used
+  | (if $cols > 0 then $cols - $used - 6 else 60 end) as $room
   | (if ($rawnote | length) == 0 or $room < 4 then ""
      elif ($rawnote | length) > $room then $rawnote[:$room - 1] + "…"
      else $rawnote end) as $note
   | ($icon | c($tone)) + " " + ($label | c("1"))
-    + (if $bounded then " " + gauge([$b.done / $b.total, 1] | min; $w; $fill) else "" end)
+    + " " + (if $bounded then gauge([$wdone / $wtotal, 1] | min; $w; $fill)
+             elif $run then scanner($now; $w; $fill) else ("░" | rep($w) | muted) end)
     + " " + $counts
-    + (" · " | c("2")) + ($meta | c("2"))
-    + (if $stalled then (" · " | c("2")) + ($stalltxt | c("33")) else "" end)
-    + (if $note != "" then (" · " | c("2")) + $note + ($onit | c("33")) else "" end);
+    + "  " + ($meta | muted)
+    + (if $stalled then ("  " + $stalltxt | c("33")) else "" end)
+    + (if $note != "" then ("  › " | muted) + $note + ($onit | c("33")) else "" end);
 now as $now
 | map(select(type == "object" and has("started_at")))
 # a bar that reached its total counts as finished even if `done` was never called
 | map(if .state == "running" and .total != null and .total > 0 and .done >= .total
-      then .state = "done" | .finished_at = .updated_at else . end)
+      then .state = "done" | .finished_at = .updated_at
+           | if (.weights // {} | length) > 0 then .wdone = (.weights | add) else . end
+      else . end)
 | map(select(
     (.state == "running" and ($now - .updated_at) < $stalehide)
     or (.state != "running" and ($now - (.finished_at // .updated_at)) < $keep)))
 | sort_by(.started_at)
 | (map(.label | length) | max // 0 | if . > 32 then 32 else . end) as $labelw
 | .[] | line($now; $labelw)
-
 '
 
 render_session() { # SID COLS COLOR
@@ -310,7 +356,7 @@ render_session() { # SID COLS COLOR
   files=("$ROOT/$1"/*.json)
   shopt -u nullglob
   [ ${#files[@]} -gt 0 ] || return 0
-  jq -rs --argjson cols "$2" --argjson color "$3" \
+  jq -rs --argjson cols "$2" --argjson color "$3" --arg muted "$MUTED" \
      --argjson keep "$KEEP_DONE" --argjson stalehide "$STALE_HIDE" \
      "$JQ_RENDER" "${files[@]}" 2>/dev/null
   return 0
@@ -342,12 +388,15 @@ cmd_doctor() {
   if [ -f "$script" ] && grep -q 'CC-PROGRESS' "$script"; then ok "status line block in $script"
   else bad "status line block missing — run install.sh"; fi
   interval=$(jq -r '.statusLine.refreshInterval // empty' "$settings" 2>/dev/null)
-  [ -n "$interval" ] && ok "statusLine.refreshInterval = ${interval}s" \
-    || bad "statusLine.refreshInterval unset — the bar would only redraw when a message arrives"
+  if [ -z "$interval" ]; then bad "statusLine.refreshInterval unset — the bar would only redraw when a message arrives"
+  elif [ "$interval" -gt 1 ] 2>/dev/null; then printf 'note  statusLine.refreshInterval = %ss; 1 s gives a smooth spinner and a live countdown\n' "$interval"
+  else ok "statusLine.refreshInterval = ${interval}s"; fi
   jq -e '[.hooks.PostToolUse[]?.hooks[]?.command // "" | test("cc-progress")] | any' "$settings" >/dev/null 2>&1 \
     && ok "task-list hook registered" || bad "task-list hook missing — run install.sh"
   jq -e '[.hooks.SessionEnd[]?.hooks[]?.command // "" | test("cc-progress")] | any' "$settings" >/dev/null 2>&1 \
     && ok "session-end cleanup hook registered" || bad "session-end hook missing — run install.sh"
+  jq -e '[.hooks.SubagentStop[]?.hooks[]?.command // "" | test("cc-progress")] | any' "$settings" >/dev/null 2>&1 \
+    && ok "subagent hooks registered" || bad "subagent hooks missing — run install.sh"
   if [ -n "$SID" ] && [ -e "$ROOT/$SID/.rendered" ]; then
     age=$(( $(date +%s) - $(stat -c %Y "$ROOT/$SID/.rendered") ))
     if [ "$age" -le $(( ${interval:-2} * 3 + 2 )) ]; then ok "status line polled this session ${age}s ago"
@@ -366,8 +415,10 @@ cmd_show() {
 }
 
 # -------------------------------------------------------------------- hook
-# PostToolUse on TaskCreate|TaskUpdate|TodoWrite keeps a `--tasks` bar in step
-# with Claude's own task list; SessionEnd removes the session's bars.
+# PostToolUse on TaskCreate|TaskUpdate|TodoWrite (and TaskCreated/TaskCompleted) keep a
+# `--tasks` bar in step with Claude's own task list; SubagentStart/SubagentStop keep an
+# `--agents` bar in step with running subagents; SessionEnd removes the session's bars.
+# Every handler is a few milliseconds of jq on a local file: nothing reaches the model.
 cmd_hook() {
   local sid=${CLAUDE_CODE_SESSION_ID:-} input event f
   input=$(cat)
@@ -377,8 +428,47 @@ cmd_hook() {
   [ -d "$ROOT/$sid" ] || return 0
   event=$(jq -r '.hook_event_name // empty' <<<"$input" 2>/dev/null)
   if [ "$event" = SessionEnd ]; then rm -rf "${ROOT:?}/$sid"; return 0; fi
-  [ "$event" = PostToolUse ] || return 0
   SID=$sid
+  case "$event" in
+    SubagentStart|SubagentStop)
+      for f in "$ROOT/$sid"/*.json; do
+        [ -e "$f" ] || continue
+        grep -q '"mode":"agents"' "$f" && grep -q '"state":"running"' "$f" || continue
+        ID=$(basename "$f" .json)
+        mutate '($h.agent_id // "" | tostring) as $a
+          | (.tasks.completed + (if $event == "SubagentStop" then [$a] else [] end)) as $done
+          | if $event == "SubagentStart" then
+              .tasks.created += 1 | .total = .tasks.created
+              | .tasks.subjects[$a] = ($h.agent_type // "agent")
+              | .note = (.tasks.subjects | to_entries | map(select(.key as $k | $done | index($k) | not)) | map(.value) | unique | join(", "))
+              | .updated_at = now
+            else
+              .tasks.completed |= (. + [$a] | unique) | .total = ([.tasks.created, (.tasks.completed | length)] | max)
+              | .note = (.tasks.subjects | to_entries | map(select(.key as $k | $done | index($k) | not)) | map(.value) | unique | join(", "))
+              | bump(.tasks.completed | length)
+            end' --argjson h "$input" --arg event "$event"
+      done
+      return 0 ;;
+    TaskCreated|TaskCompleted)
+      # field names read defensively: these events are newer than the payloads captured in tests/
+      for f in "$ROOT/$sid"/*.json; do
+        [ -e "$f" ] || continue
+        grep -q '"mode":"tasks"' "$f" && grep -q '"state":"running"' "$f" || continue
+        ID=$(basename "$f" .json)
+        mutate '($h.task_id // $h.task.id // $h.tool_input.taskId // $h.taskId // "" | tostring) as $k
+          | ($h.task_subject // $h.task.subject // $h.subject // null) as $subj
+          | if $event == "TaskCreated" then
+              (if $k != "" and (.tasks.subjects[$k] == null) then .tasks.created += 1 | .tasks.subjects[$k] = ($subj // "task \($k)") else . end)
+            else
+              (if $k != "" then .tasks.completed |= (. + [$k] | unique) else . end)
+            end
+          | .total = ([.tasks.created - (.tasks.deleted | length), (.tasks.completed | length)] | max)
+          | bump(.tasks.completed | length)' --argjson h "$input" --arg event "$event"
+      done
+      return 0 ;;
+    PostToolUse) ;;
+    *) return 0 ;;
+  esac
   for f in "$ROOT/$sid"/*.json; do
     [ -e "$f" ] || continue
     grep -q '"mode":"tasks"' "$f" && grep -q '"state":"running"' "$f" || continue
