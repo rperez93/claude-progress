@@ -18,10 +18,15 @@ figure is a floor, and the time spent on that item follows its name in amber. Th
 time of day appears once the ETA reaches a minute. A bar without a total shows a block
 sweeping back and forth instead of a fill.
 
+A rule as wide as the widest bar closes the block, so the rows above read as progress and
+the rows below as the ordinary status line; it exists only while a bar is shown.
+
 Colours are the terminal's own ANSI roles (green, cyan, yellow, red, bright black, bold),
 never fixed RGB values, so the bar follows whatever theme the terminal uses. Set
-`CC_PROGRESS_MUTED=2` if the theme's bright black is unreadable (faint is used instead), or
-`NO_COLOR=1` for plain text.
+`CC_PROGRESS_MUTED=2` if the theme's bright black is unreadable (faint is used instead),
+`CC_PROGRESS_ASCII=1` for fonts without braille or block glyphs, or `NO_COLOR=1` for plain
+text. Notes and labels are stripped of control characters and escape sequences before
+they reach the terminal.
 
 ## How it works
 
@@ -88,6 +93,14 @@ cc-progress done
 The count still reads `3/23 files`; the gauge, the percentage and the ETA are on tests.
 `--weights` takes `WEIGHT NAME` lines (the shape `wc -l` prints) or a JSON object.
 
+### On request
+
+Ask Claude to *update the progress bar*, *refresh the ETA*, *what is left*, or *clear the
+bars*: the skill reads the bars (`cc-progress show`), checks the source of truth (the log,
+the file list, the queue), corrects them (`set`, `total`, `note`, `done`, `fail`) and reports
+in one line. `cc-progress prune` removes finished, failed and stale bars; `prune --all`
+removes every bar of the session. Finished bars also leave on their own after a minute.
+
 ### Agents and tasks, hands free
 
 ```bash
@@ -120,5 +133,7 @@ cc-progress start --tasks  --label "Refactor"    # then create the tasks
   (`CC_PROGRESS_STALE_HIDE`).
 - Updating commands exit 0 on operational errors so that progress reporting cannot break
   the job it reports on.
+- A running bar that only hooks write (`--tasks`, `--agents`) is never flagged stalled and
+  never pruned as stale: silence there means nothing happened, not that the writer died.
 - `cc-progress doctor` checks the installation and reports when the status line last polled.
 - `CC_PROGRESS_HOOK_LOG=/path` in Claude Code's environment appends every hook payload there.

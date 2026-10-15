@@ -7,11 +7,13 @@
 # time, so the bar keeps moving while a single long command runs.
 set -u
 
-VERSION=0.3.0
+VERSION=0.4.0
 ROOT="${CC_PROGRESS_DIR:-$HOME/.claude/progress}"
 KEEP_DONE="${CC_PROGRESS_KEEP_DONE:-60}"       # seconds a finished bar stays visible
 STALE_HIDE="${CC_PROGRESS_STALE_HIDE:-7200}"   # seconds without an update before a running bar is hidden
 MUTED="${CC_PROGRESS_MUTED:-90}"               # SGR code for secondary text: 90 = the theme's bright black, 2 = faint
+ASCII="${CC_PROGRESS_ASCII:-0}"                # 1 = no braille, no block glyphs (fonts without them)
+PRUNE_AFTER="${CC_PROGRESS_PRUNE_AFTER:-600}"  # prune: a running bar with no write for this long is stale
 
 usage() {
   cat <<'EOF'
@@ -33,6 +35,8 @@ cc-progress — progress bars with ETA for the Claude Code status line
   cc-progress done  [--note TEXT]              mark finished (kept on screen briefly)
   cc-progress fail  [--note TEXT]              mark failed
   cc-progress clear [--all]                    remove the bar (or every bar of the session)
+  cc-progress prune [--all]                    remove finished, failed and stale bars (--all: every bar);
+                                               hook-fed bars (--tasks, --agents) are never stale
   cc-progress pipe  [--total N] [--label TEXT] [--match REGEX] [--quiet]
                                                pass stdin through, one tick per (matching) line
   cc-progress show                             print the bars as the status line would
@@ -219,6 +223,24 @@ cmd_finish() { # $1 = done | error
     --arg state "$1" --arg note "$NOTE" --argjson hasnote "$HAS_NOTE"
 }
 
+cmd_prune() { # finished, failed, or running with no write for PRUNE_AFTER seconds; --all: everything
+  need_session
+  local f n=0
+  if [ "$ALL" = 1 ]; then rm -rf "${ROOT:?}/$SID"; echo "removed every bar of the session"; return 0; fi
+  shopt -s nullglob
+  for f in "$ROOT/$SID"/*.json; do
+    if jq -e --argjson stale "$PRUNE_AFTER" '
+         .state != "running"
+         or (.total != null and .total > 0 and .done >= .total)
+         or (.mode == "manual" and (now - .updated_at) > $stale)' "$f" >/dev/null 2>&1; then
+      rm -f "$f"; n=$((n + 1)); echo "removed $(basename "$f" .json)"
+    fi
+  done
+  shopt -u nullglob
+  [ "$n" -gt 0 ] || echo "nothing to prune"
+  return 0
+}
+
 cmd_clear() {
   need_session
   if [ "$ALL" = 1 ]; then rm -rf "${ROOT:?}/$SID"; else rm -f "$ROOT/$SID/$ID.json"; fi
@@ -257,17 +279,25 @@ def c($code): if $color and length > 0 then "\u001b[\($code)m" + . + "\u001b[0m"
 def muted: c($muted);
 def padr($n): length as $l | . + (" " | rep($n - $l));
 def singular: if test("s$") and length > 1 then .[:-1] else . end;
+# glyphs; CC_PROGRESS_ASCII=1 for fonts without braille or block characters
+def G: if $ascii then {full: "#", empty: "-", parts: [""], scan: "===", spin: ["|", "/", "-", "\\"],
+                       ok: "+", bad: "x", wait: ">", note: ">", rule: "-", ellipsis: "...", more: ".."}
+       else {full: "█", empty: "░", parts: ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"], scan: "▓▓▓",
+             spin: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+             ok: "✔", bad: "✘", wait: "▶", note: "›", rule: "─", ellipsis: "…", more: "…"} end;
+def clean: gsub("\u001b\\[[0-9;?]*[A-Za-z]"; " ") | gsub("[[:cntrl:]]"; " ") | gsub(" +"; " ") | gsub("^ | $"; "");
 def gauge($f; $w; $tone):
-  ($f * $w * 8 | floor) as $e | ($e / 8 | floor) as $full | ($e % 8) as $p
-  | (if $full >= $w or $p == 0 then "" else ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][$p] end) as $part
-  | (("█" | rep($full)) + $part | c($tone)) + ("░" | rep($w - $full - ($part | length)) | muted);
+  ($f * $w * (G.parts | length) | floor) as $e | (G.parts | length) as $n
+  | ($e / $n | floor) as $full | ($e % $n) as $p
+  | (if $full >= $w or $p == 0 then "" else G.parts[$p] end) as $part
+  | ((G.full | rep($full)) + $part | c($tone)) + (G.empty | rep($w - $full - ($part | length)) | muted);
 # no total: a block sweeping back and forth, one cell per poll
 def scanner($now; $w; $tone):
   (($w - 3) * 2) as $period | (($now | floor) % $period) as $i
   | (if $i < $w - 2 then $i else $period - $i end) as $pos
-  | ("░" | rep($pos) | muted) + ("▓▓▓" | c($tone)) + ("░" | rep($w - 3 - $pos) | muted);
+  | (G.empty | rep($pos) | muted) + (G.scan | c($tone)) + (G.empty | rep($w - 3 - $pos) | muted);
 # one frame per poll (refreshInterval 1 s): a bar that is not moving is visibly still watched
-def spinner($now): ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][($now | floor) % 10];
+def spinner($now): G.spin[($now | floor) % (G.spin | length)];
 def line($now; $labelw):
   . as $b
   | ($b.state == "running") as $run
@@ -296,12 +326,13 @@ def line($now; $labelw):
   | (if $overdue then $wgained / ($now - $s0[0]) else $rate end) as $rate
   | (if $next != null then ([$next, 0] | max) + ([$left - $wcur, 0] | max) / $rate else null end) as $eta
   | ($now - $b.updated_at) as $idle
-  | ($run and $idle > ([120, (if $rate != null then 3 * $wcur / $rate else 0 end)] | max)) as $stalled
+  # hook-fed bars (tasks, agents) are written only when something happens: silence is not a stall
+  | ($run and $b.mode == "manual" and $idle > ([120, (if $rate != null then 3 * $wcur / $rate else 0 end)] | max)) as $stalled
   | (if $b.unit != "" then " " + $b.unit else "" end) as $unit
-  | (if $run then (if $stalled then "▶" else spinner($now) end) elif $b.state == "done" then "✔" else "✘" end) as $icon
+  | (if $run then (if $stalled then G.wait else spinner($now) end) elif $b.state == "done" then G.ok else G.bad end) as $icon
   | (if $run then (if $stalled then "33" else "36" end) elif $b.state == "done" then "1;32" else "1;31" end) as $tone
   | (if $run then "32" elif $b.state == "done" then "32" else "31" end) as $fill
-  | ($b.label | if length > 32 then .[:31] + "…" else . end | padr($labelw)) as $label
+  | ($b.label | clean | if length > 32 then .[:31] + G.more else . end | padr($labelw)) as $label
   | (if $cols > 0 and $cols < 80 then 10 else 20 end) as $w
   | (if $bounded then "\([$wdone / $wtotal * 100, 100] | min | floor)%" else "" end) as $pct
   | (if $bounded then "\($b.done | num)/\($b.total | num)\($unit) " + ($pct | c("1"))
@@ -312,7 +343,7 @@ def line($now; $labelw):
   | (if $eta != null then
        "ETA " + (if $overdue then "≥" else "~" end) + ($eta | dur)
        + (if $eta >= 60 then " at " + ($now + $eta | strflocaltime("%H:%M")) else "" end)
-     elif $run and $bounded and $left > 0 then "ETA …"
+     elif $run and $bounded and $left > 0 then "ETA " + G.ellipsis
      else "" end) as $etatxt
   | (if $rate == null or $weighted then ""
      elif $rate >= 1 then "\($rate | num)/s"
@@ -320,21 +351,23 @@ def line($now; $labelw):
           + (if $b.unit != "" then "/" + ($b.unit | singular) else " each" end) end) as $ratetxt
   | (if $stalled then "no update for " + ($idle | dur) else "" end) as $stalltxt
   | ([$time, $etatxt, $ratetxt] | map(select(length > 0)) | join(" · ")) as $meta
-  | ($b.note // "" | gsub("[\\n\\r\\t]"; " ") | gsub("^ +| +$"; "")) as $rawnote
+  | ($b.note // "" | clean) as $rawnote
   | (if $overdue and ($rawnote | length) > 0 then " " + ($now - $last[0] | dur) else "" end) as $onit
   | (2 + ($label | length) + (if $bounded then $w + 1 else 0 end) + 1 + ($counts | length)
      + 2 + ($meta | length) + (if $stalled then 3 + ($stalltxt | length) else 0 end) + ($onit | length)) as $used
   | (if $cols > 0 then $cols - $used - 6 else 60 end) as $room
   | (if ($rawnote | length) == 0 or $room < 4 then ""
-     elif ($rawnote | length) > $room then $rawnote[:$room - 1] + "…"
+     elif ($rawnote | length) > $room then $rawnote[:$room - 1] + G.more
      else $rawnote end) as $note
   | ($icon | c($tone)) + " " + ($label | c("1"))
     + " " + (if $bounded then gauge([$wdone / $wtotal, 1] | min; $w; $fill)
-             elif $run then scanner($now; $w; $fill) else ("░" | rep($w) | muted) end)
+             elif $run then scanner($now; $w; $fill) else (G.empty | rep($w) | muted) end)
     + " " + $counts
     + "  " + ($meta | muted)
     + (if $stalled then ("  " + $stalltxt | c("33")) else "" end)
-    + (if $note != "" then ("  › " | muted) + $note + ($onit | c("33")) else "" end);
+    + (if $note != "" then ("  " + G.note + " " | muted) + $note + ($onit | c("33")) else "" end);
+# visible width of a rendered line
+def width: gsub("\u001b\\[[0-9;]*m"; "") | length;
 now as $now
 | map(select(type == "object" and has("started_at")))
 # a bar that reached its total counts as finished even if `done` was never called
@@ -346,17 +379,23 @@ now as $now
     (.state == "running" and ($now - .updated_at) < $stalehide)
     or (.state != "running" and ($now - (.finished_at // .updated_at)) < $keep)))
 | sort_by(.started_at)
-| (map(.label | length) | max // 0 | if . > 32 then 32 else . end) as $labelw
-| .[] | line($now; $labelw)
+| (map(.label | clean | length) | max // 0 | if . > 32 then 32 else . end) as $labelw
+| [.[] | line($now; $labelw)]
+# a rule after the bars, as wide as the widest bar, so the rows above read as one
+# block (progress) and the rows below as another (the usual status line)
+| if length == 0 or ($divider | not) then .[]
+  else (map(width) | max) as $wmax
+     | .[], (G.rule | rep(if $cols > 0 then ([$wmax, $cols] | min) else $wmax end) | muted) end
 '
 
-render_session() { # SID COLS COLOR
+render_session() { # SID COLS COLOR DIVIDER
   local files
   shopt -s nullglob
   files=("$ROOT/$1"/*.json)
   shopt -u nullglob
   [ ${#files[@]} -gt 0 ] || return 0
-  jq -rs --argjson cols "$2" --argjson color "$3" --arg muted "$MUTED" \
+  jq -rs --argjson cols "$2" --argjson color "$3" --argjson divider "${4:-false}" \
+     --arg muted "$MUTED" --argjson ascii "$([ "$ASCII" = 1 ] && echo true || echo false)" \
      --argjson keep "$KEEP_DONE" --argjson stalehide "$STALE_HIDE" \
      "$JQ_RENDER" "${files[@]}" 2>/dev/null
   return 0
@@ -373,7 +412,7 @@ cmd_render() {
   [ -n "${NO_COLOR:-}" ] && color=false
   # stamp each poll so `doctor` can tell whether the status line is really refreshing
   [ -d "$ROOT/$sid" ] && : > "$ROOT/$sid/.rendered" 2>/dev/null
-  render_session "$sid" "$(cols)" "$color"
+  render_session "$sid" "$(cols)" "$color" true
 }
 
 cmd_doctor() {
@@ -411,7 +450,7 @@ cmd_show() {
   need_session
   local color=false
   [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && color=true
-  render_session "$SID" "$(cols)" "$color"
+  render_session "$SID" "$(cols)" "$color" false
 }
 
 # -------------------------------------------------------------------- hook
@@ -513,6 +552,7 @@ case "$CMD" in
   done)    cmd_finish done ;;
   fail)    cmd_finish error ;;
   clear)   cmd_clear ;;
+  prune)   cmd_prune ;;
   pipe)    cmd_pipe ;;
   show)    cmd_show ;;
   render)  cmd_render ;;

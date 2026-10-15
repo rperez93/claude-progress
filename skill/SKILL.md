@@ -100,6 +100,20 @@ End with `cc-progress done` (stays visible for a minute, then disappears) or
 automatically; one abandoned mid-way shows "no update for …" until cleared with
 `cc-progress clear`. Run the finish command even on the failure path.
 
+## When the user asks about the bar
+
+Invoked as `/progress-bar update`, `/progress-bar clear`, or in words ("update the
+progress bar", "refresh the ETA", "how many are left", "remove the finished bars"):
+
+1. `cc-progress show` — read every bar of the session as rendered.
+2. Check the source of truth the bar stands for (the log, the output directory, the
+   queue, the task list) and correct the bar: `cc-progress set N`, `total N`,
+   `note TEXT`, `done` or `fail` as the facts require. A bar whose job has ended
+   must be finished, not left running.
+3. `cc-progress prune` removes finished, failed and stale bars; `prune --all`
+   removes every bar of the session. Use it when asked to clear or clean up.
+4. Report in one line what the bars now say, and what you corrected.
+
 ## Several bars
 
 Name them: `--id download`, `--id build`. Each renders on its own row with the
@@ -118,6 +132,7 @@ cc-progress total N
 cc-progress note  TEXT
 cc-progress done | fail [--note TEXT]
 cc-progress clear [--all]
+cc-progress prune [--all]   # finished, failed and stale bars; --all: every bar
 cc-progress pipe  [--total N] [--label TEXT] [--match REGEX] [--quiet]
 cc-progress show            # print the bars as text — use it to check, or to report in chat
 ```

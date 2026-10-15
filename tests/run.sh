@@ -85,6 +85,16 @@ check "pipe counts lines"    "$(jq -c '[.done, .state]' "$CC_PROGRESS_DIR/test/p
 check "pipe passes through"  "$(printf 'a\nb\n' | "$P" pipe --id pt)" "b"
 
 "$P" tick --id missing 2>/dev/null; check "tick without bar exits 0" "$?" "0"
+
+"$P" note --id free "$(printf 'bad\033[31mcolour\ttab')"
+check "escape codes stripped from the note" "$("$P" show | grep Scanning)" "bad colour tab"
+out=$(echo '{"session_id":"test"}' | "$P" render)
+check "render ends with a divider"  "$(printf '%s' "$out" | tail -1)" "────"
+check "divider as wide as the widest bar" "$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g' | awk '{ if (length($0) > m) m = length($0) } END { print m }')" "$(printf '%s' "$out" | tail -1 | sed 's/\x1b\[[0-9;]*m//g' | awk '{ print length($0) }')"
+check "show has no divider"        "$("$P" show | grep -c '────')" "0"
+check "ascii mode"                 "$(CC_PROGRESS_ASCII=1 "$P" show | grep Converting)" "####"
+check "ascii divider"              "$(echo '{"session_id":"test"}' | CC_PROGRESS_ASCII=1 "$P" render | tail -1)" "----"
+check "empty session renders nothing" "$(echo '{"session_id":"nobody"}' | "$P" render | wc -c)" "0"
 "$P" fail --id par --note boom
 check "failure shown"        "$("$P" show)" "✘ par"
 
@@ -107,6 +117,8 @@ echo '{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"general-p
 echo '{"hook_event_name":"SubagentStart","agent_id":"a2","agent_type":"Explore"}' | "$P" hook
 check "agents: two started"   "$("$P" show | grep Agents)" "0/2"
 check "agents: running types in note" "$("$P" show | grep Agents)" "Explore, general-purpose"
+jq -c '.updated_at -= 1800 | .samples[] |= (.[0] -= 1800)' "$CC_PROGRESS_DIR/test/agents.json" > "$CC_PROGRESS_DIR/x" && mv "$CC_PROGRESS_DIR/x" "$CC_PROGRESS_DIR/test/agents.json"
+check "hook-fed bar is never flagged stalled" "$("$P" show | grep Agents | grep -c 'no update')" "0"
 echo '{"hook_event_name":"SubagentStop","agent_id":"a1","agent_type":"general-purpose"}' | "$P" hook
 check "agents: one finished"  "$("$P" show | grep Agents)" "1/2"
 check "agents: finished one leaves the note" "$("$P" show | grep Agents | grep -c general-purpose)" "0"
@@ -119,6 +131,14 @@ check "TaskCompleted idempotent" "$("$P" show | grep Plan)" "2/4"
 echo '{"hook_event_name":"TaskCreated","task_id":"10","task_subject":"event first"}' | "$P" hook
 echo '{"hook_event_name":"PostToolUse","tool_name":"TaskCreate","tool_input":{"subject":"event first"},"tool_response":{"task":{"id":"10","subject":"event first"}}}' | "$P" hook
 check "TaskCreated before TaskCreate counts once" "$("$P" show | grep Plan)" "2/5"
+"$P" start --id keep --total 5 --label Keep; "$P" tick --id keep
+"$P" start --id old --total 5 --label Old
+for b in old agents; do jq -c '.updated_at -= 3600' "$CC_PROGRESS_DIR/test/$b.json" > "$CC_PROGRESS_DIR/x" && mv "$CC_PROGRESS_DIR/x" "$CC_PROGRESS_DIR/test/$b.json"; done
+out=$("$P" prune)
+check "prune removes finished bars"  "$out" "removed w"
+check "prune removes stale bars"     "$out" "removed old"
+[ -e "$CC_PROGRESS_DIR/test/keep.json" ] && echo "ok   prune keeps a live bar" || { echo "FAIL prune removed a live bar"; fails=$((fails + 1)); }
+[ -e "$CC_PROGRESS_DIR/test/agents.json" ] && echo "ok   prune keeps a hook-fed bar" || { echo "FAIL prune removed the agents bar"; fails=$((fails + 1)); }
 echo '{"hook_event_name":"SessionEnd"}' | "$P" hook
 check "session end cleans up" "$(ls "$CC_PROGRESS_DIR")" ""
 
