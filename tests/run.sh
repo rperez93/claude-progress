@@ -75,7 +75,7 @@ check "done fills the weighted gauge" "$("$P" show | grep Weighted)" "100%"
 printf '0 a.py\n0 b.py\n' > "$CC_PROGRESS_DIR/w0.txt"
 "$P" start --id w0 --label Zero --weights "$CC_PROGRESS_DIR/w0.txt"; "$P" tick --id w0 --item a.py
 check "all-zero weights still render" "$("$P" show | grep Zero)" "1/2 50%"
-printf '{"id":"bad","label":"Broken","state":"running","started_at":"soon","updated_at":1,"done":"x","total":3,"samples":[]}' > "$CC_PROGRESS_DIR/test/bad.json"
+printf '{"id":"bad","label":"Broken","state":"running","started_at":"soon","updated_at":'"$(date +%s)"',"done":null,"total":3,"samples":[]}' > "$CC_PROGRESS_DIR/test/bad.json"
 check "a corrupt bar degrades one line" "$("$P" show | grep Broken)" "cannot be rendered"
 check "...and the others still render" "$("$P" show | grep -c Zero)" "1"
 rm -f "$CC_PROGRESS_DIR/test/bad.json" "$CC_PROGRESS_DIR/test/w0.json"

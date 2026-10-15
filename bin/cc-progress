@@ -304,11 +304,11 @@ def line($now; $labelw):
   | ((if $run then $now else ($b.finished_at // $b.updated_at) end) - $b.started_at) as $elapsed
   | ($b.weights // {} | length > 0 and (($b.weights | add) > 0)) as $weighted   # all-zero weights: unweighted
   | (if $weighted then ($b.weights | add) else $b.total end) as $wtotal
-  | ($b.wdone // $b.done) as $wdone
+  | (if $weighted then ($b.wdone // $b.done) else $b.done end) as $wdone
   | ($b.samples[0] // [$b.started_at, 0, 0]) as $s0
   | ($b.samples[-1] // $s0) as $last                 # last real progress, not the last heartbeat
   | ($b.done - $s0[1]) as $gained                    # units completed while the bar was watching
-  | ($wdone - ($s0[2] // $s0[1])) as $wgained         # the same, in work units
+  | (if $weighted then $wdone - ($s0[2] // $s0[1]) else $gained end) as $wgained   # the same, in work units
   | (if $run then
        (if $wgained > 0 and ($last[0] - $s0[0]) >= 1 then $wgained / ($last[0] - $s0[0]) else null end)
      else (if $wgained > 0 and $elapsed > 0 then $wgained / $elapsed else null end) end) as $rate
