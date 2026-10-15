@@ -3,9 +3,15 @@
 Progress bars with count, elapsed time and ETA in the Claude Code status line.
 
 ```
-▶ Converting ██████▌░░░░░░░░░░░░░ 13/40 files 32% · 1m18s · ETA ~2m42s · avg 6s · report-q3.pdf
-✔ Tests 240/240 tests 100% · done in 4m02s · avg 1s
+⠹ Converting ██████▌░░░░░░░░░░░░░ 13/40 files 32% · 1m18s · ETA ~2m42s → 14:07 · 6s/file · report-q3.pdf
+⠹ Sweep      ████████████████▌░░░ 19/23 files 82% · 13m01s · ETA ≥2m03s → 14:09 · 41s/file · test_rules_sweep.py (11m30s)
+✔ Tests      240/240 tests 100% · done in 4m02s · 1s/test
 ```
+
+The braille spinner advances once per status line poll, so a bar that is not moving is
+visibly still being watched. `ETA ~` is an estimate on schedule; `ETA ≥` means the current
+item is already past the average and the figure is a floor, with the time spent on that
+item shown after its name. The finish time of day is shown once the ETA reaches a minute.
 
 ## How it works
 
@@ -50,9 +56,21 @@ pytest -v | cc-progress pipe --total 240 --label Tests --match 'PASSED|FAILED'
 
 ## Behaviour worth knowing
 
-- ETA is `remaining ÷ rate` over roughly the last 30 samples, counted down between
-  updates. No ETA is shown without a total, before the first unit completes, or before
-  one second of data exists.
+- **ETA.** The rate is units completed *while the bar was watching* over the time between
+  the first and the last completion (at most the last 30 completions). The next unit is
+  expected one average interval after the last one, so the ETA counts down between
+  updates. Once the current unit is overdue the average starts counting the unit in
+  flight, the ETA is shown as `≥` and grows with it: a workload of unequal items pushes
+  the estimate out instead of pretending. No ETA is shown without a total, before the
+  first unit completes under observation, or before one second of data exists.
+- **Work done before the bar started** is a baseline, not progress: `start --done N`, or a
+  `set` that jumps more than one unit within two seconds of `start`, shows the count
+  without feeding the rate. Only completions the bar actually observed produce an ETA.
+- **Heartbeats are not progress.** `updated_at` moves on every write (that is what the
+  `no update for …` stall check reads); the ETA anchor and the rate only move when `done`
+  changes. A polling loop that re-`set`s the same value every few seconds is harmless.
+- Several bars in one session have their labels aligned; give them labels that differ
+  in what the user cares about (`--label "Tests · main"` / `--label "Tests · v118"`).
 - A bar reaching its total is shown as finished. Finished bars stay 60 s
   (`CC_PROGRESS_KEEP_DONE`). A running bar with no update for 2 minutes (or three average
   intervals, whichever is longer) is flagged `no update for …`, and hidden after 2 h

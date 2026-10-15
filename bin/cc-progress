@@ -7,7 +7,7 @@
 # time, so the bar keeps moving while a single long command runs.
 set -u
 
-VERSION=0.1.0
+VERSION=0.2.0
 ROOT="${CC_PROGRESS_DIR:-$HOME/.claude/progress}"
 KEEP_DONE="${CC_PROGRESS_KEEP_DONE:-60}"       # seconds a finished bar stays visible
 STALE_HIDE="${CC_PROGRESS_STALE_HIDE:-7200}"   # seconds without an update before a running bar is hidden
@@ -16,7 +16,9 @@ usage() {
   cat <<'EOF'
 cc-progress — progress bars with ETA for the Claude Code status line
 
-  cc-progress start [--total N] [--label TEXT] [--unit WORD] [--note TEXT] [--tasks]
+  cc-progress start [--total N] [--done N] [--label TEXT] [--unit WORD] [--note TEXT] [--tasks]
+                                               --done: units already finished before the bar
+                                               started (shown, but not counted into the rate)
   cc-progress tick  [N] [--note TEXT]          advance by N (default 1)
   cc-progress set   DONE [--total N] [--note TEXT]
   cc-progress total N                          correct the total mid-run
@@ -47,7 +49,7 @@ is_num() { [[ ${1:-} =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 
 # ---------------------------------------------------------------- arguments
 CMD="${1:-}"; [ $# -gt 0 ] && shift
-ID=main SID_OPT="" TOTAL="" LABEL="" UNIT="" NOTE="" MATCH=""
+ID=main SID_OPT="" TOTAL="" LABEL="" UNIT="" NOTE="" MATCH="" DONE0=0
 HAS_TOTAL=0 HAS_LABEL=0 HAS_NOTE=0 TASKS=0 ALL=0 QUIET=0
 POS=()
 while [ $# -gt 0 ]; do
@@ -55,6 +57,7 @@ while [ $# -gt 0 ]; do
     --id)       [ $# -ge 2 ] || die "--id needs a value";      ID=$2; shift 2 ;;
     --session)  [ $# -ge 2 ] || die "--session needs a value"; SID_OPT=$2; shift 2 ;;
     --total)    [ $# -ge 2 ] || die "--total needs a value";   TOTAL=$2; HAS_TOTAL=1; shift 2 ;;
+    --done)     [ $# -ge 2 ] || die "--done needs a value";    DONE0=$2; shift 2 ;;
     --label)    [ $# -ge 2 ] || die "--label needs a value";   LABEL=$2; HAS_LABEL=1; shift 2 ;;
     --unit)     [ $# -ge 2 ] || die "--unit needs a value";    UNIT=$2; shift 2 ;;
     --note)     [ $# -ge 2 ] || die "--note needs a value";    NOTE=$2; HAS_NOTE=1; shift 2 ;;
@@ -70,6 +73,7 @@ done
 
 [[ $ID =~ ^[A-Za-z0-9_.-]+$ ]] || die "invalid --id '$ID' (letters, digits, _ . - only)"
 [ "$HAS_TOTAL" = 0 ] || is_num "$TOTAL" || die "--total must be a non-negative number"
+is_num "$DONE0" || die "--done must be a non-negative number"
 
 SID=""
 need_session() {
@@ -80,11 +84,20 @@ need_session() {
 
 # ------------------------------------------------------------------- state
 JQ_LIB='
+# samples = [[time, done], ...]: the progress history the renderer derives rate and
+# ETA from. updated_at is only a heartbeat (the writer is alive); a `set` to the
+# same value, a `note` or a `total` never add a sample, so they cannot move the
+# ETA anchor or inflate the rate.
 def bump($d):
   if $d != .done then
     .done = $d
     | .samples = (
-        if (.samples | length) > 1 and (now - .samples[-2][0]) < 1
+        # a jump of more than one unit within 2 s of start is work that was finished
+        # before the bar existed: make it the baseline, do not count it as rate
+        if (.samples | length) == 1 and (now - .samples[0][0]) < 2 and ($d - .samples[0][1]) > 1
+        then [[now, $d]]
+        # bursts: keep at most one sample per second, the first sample never moves
+        elif (.samples | length) > 1 and (now - .samples[-2][0]) < 1
         then .samples[:-1] + [[now, $d]]
         else .samples + [[now, $d]] end
         | .[-30:])
@@ -131,11 +144,11 @@ cmd_start() {
   [ "$TASKS" = 1 ] && mode=tasks
   [ "$TASKS" = 1 ] && [ "$ID" = main ] && ID=tasks
   [ "$HAS_LABEL" = 1 ] || LABEL=$ID
-  mutate '{id: $id, label: $label, unit: $unit, total: $total, done: 0, state: "running",
+  mutate '{id: $id, label: $label, unit: $unit, total: $total, done: $done0, state: "running",
            note: $note, mode: $mode, started_at: now, updated_at: now, finished_at: null,
-           samples: [[now, 0]], tasks: {created: 0, completed: [], deleted: [], subjects: {}}}' \
+           samples: [[now, $done0]], tasks: {created: 0, completed: [], deleted: [], subjects: {}}}' \
     --arg id "$ID" --arg label "$LABEL" --arg unit "$UNIT" --arg note "$NOTE" \
-    --arg mode "$mode" --argjson total "$total"
+    --arg mode "$mode" --argjson total "$total" --argjson done0 "$DONE0"
 }
 
 cmd_tick() {
@@ -209,61 +222,74 @@ def dur: (if . < 0 then 0 else . end | floor) as $s
     else "\($s / 3600 | floor)h\($s % 3600 / 60 | floor | pad2)m" end;
 def num: if . == floor then floor | tostring else (. * 10 | round / 10 | tostring) end;
 def c($code): if $color and length > 0 then "\u001b[\($code)m" + . + "\u001b[0m" else . end;
-def gauge($f; $w):
+def padr($n): length as $l | . + (" " | rep($n - $l));
+def singular: if test("s$") and length > 1 then .[:-1] else . end;
+def gauge($f; $w; $tone):
   ($f * $w * 8 | floor) as $e | ($e / 8 | floor) as $full | ($e % 8) as $p
   | (if $full >= $w or $p == 0 then "" else ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][$p] end) as $part
-  | (("█" | rep($full)) + $part | c("32")) + ("░" | rep($w - $full - ($part | length)) | c("2"));
-def line($now):
+  | (("█" | rep($full)) + $part | c($tone)) + ("░" | rep($w - $full - ($part | length)) | c("2"));
+# One frame per status line poll (2 s): proves the display is live even when nothing moves.
+def spinner($now): ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][($now / 2 | floor) % 10];
+def line($now; $labelw):
   . as $b
   | ($b.state == "running") as $run
   | ((if $run then $now else ($b.finished_at // $b.updated_at) end) - $b.started_at) as $elapsed
   | ($b.samples[0] // [$b.started_at, 0]) as $s0
+  | ($b.samples[-1] // $s0) as $last                 # last real progress, not the last heartbeat
+  | ($b.done - $s0[1]) as $gained                    # units completed while the bar was watching
   | (if $run then
-       (if $b.done > $s0[1] and ($b.updated_at - $s0[0]) >= 1
-        then ($b.done - $s0[1]) / ($b.updated_at - $s0[0]) else null end)
-     else (if $b.done > 0 and $elapsed > 0 then $b.done / $elapsed else null end) end) as $rate
+       (if $gained > 0 and ($last[0] - $s0[0]) >= 1 then $gained / ($last[0] - $s0[0]) else null end)
+     else (if $gained > 0 and $elapsed > 0 then $gained / $elapsed else null end) end) as $rate
   | ($b.total != null and $b.total > 0) as $bounded
-  | (if $run and $rate != null and $bounded and $b.done < $b.total
-     then [$b.updated_at + ($b.total - $b.done) / $rate - $now,
-           ($b.total - $b.done - 1) / $rate, 0] | max
-     else null end) as $eta
+  | (if $bounded then $b.total - $b.done else 0 end) as $left
+  # the current unit is expected to finish 1/rate after the last one; while it is
+  # overdue the ETA floors at what the rest will take, and is shown as "≥"
+  | (if $run and $rate != null and $bounded and $left > 0
+     then ($last[0] + 1 / $rate - $now) else null end) as $next
+  | ($next != null and $next < 0) as $overdue
+  # once overdue, the average per unit counts the unit in flight (as tqdm does), so a
+  # workload of unequal items pushes the estimate out instead of pretending
+  | (if $overdue then $gained / ($now - $s0[0]) else $rate end) as $rate
+  | (if $next != null then ([$next, 0] | max) + ($left - 1) / $rate else null end) as $eta
   | ($now - $b.updated_at) as $idle
   | ($run and $idle > ([120, (if $rate != null then 3 / $rate else 0 end)] | max)) as $stalled
   | (if $b.unit != "" then " " + $b.unit else "" end) as $unit
-  | (if $run then "▶" elif $b.state == "done" then "✔" else "✘" end) as $icon
-  | (if $run then "32" elif $b.state == "done" then "1;32" else "1;31" end) as $tone
-  | ($b.label | if length > 32 then .[:31] + "…" else . end) as $label
+  | (if $run then (if $stalled then "▶" else spinner($now) end) elif $b.state == "done" then "✔" else "✘" end) as $icon
+  | (if $run then (if $stalled then "33" else "36" end) elif $b.state == "done" then "1;32" else "1;31" end) as $tone
+  | (if $run then "32" elif $b.state == "done" then "32" else "31" end) as $fill
+  | ($b.label | if length > 32 then .[:31] + "…" else . end | padr($labelw)) as $label
   | (if $cols > 0 and $cols < 80 then 10 else 20 end) as $w
   | (if $bounded
-     then "\($b.done | num)/\($b.total | num)\($unit) \([$b.done / $b.total * 100, 100] | min | floor)%"
+     then "\($b.done | num)/\($b.total | num)\($unit) " + ("\([$b.done / $b.total * 100, 100] | min | floor)%" | c("1"))
      else "\($b.done | num)\($unit)" end) as $counts
   | (if $run then ($elapsed | dur)
      elif $b.state == "done" then "done in " + ($elapsed | dur)
      else "failed after " + ($elapsed | dur) end) as $time
   | (if $eta != null then
-       "ETA ~" + ($eta | dur)
-       + (if $eta >= 600 then " (" + ($now + $eta | strflocaltime("%H:%M")) + ")" else "" end)
-     elif $run and $bounded and $b.done < $b.total then "ETA …"
+       "ETA " + (if $overdue then "≥" else "~" end) + ($eta | dur)
+       + (if $eta >= 60 then " → " + ($now + $eta | strflocaltime("%H:%M")) else "" end)
+     elif $run and $bounded and $left > 0 then "ETA …"
      else "" end) as $etatxt
   | (if $rate == null then ""
      elif $rate >= 1 then "\($rate | num)/s"
-     elif 1 / $rate < 10 then "avg \(1 / $rate | num)s"
-     else "avg " + (1 / $rate | dur) end) as $ratetxt
+     else (1 / $rate | if . < 10 then num + "s" else dur end)
+          + (if $b.unit != "" then "/" + ($b.unit | singular) else " each" end) end) as $ratetxt
   | (if $stalled then "no update for " + ($idle | dur) else "" end) as $stalltxt
   | ([$time, $etatxt, $ratetxt] | map(select(length > 0)) | join(" · ")) as $meta
+  | ($b.note // "" | gsub("[\\n\\r\\t]"; " ") | gsub("^ +| +$"; "")) as $rawnote
+  | (if $overdue and ($rawnote | length) > 0 then " (" + ($now - $last[0] | dur) + ")" else "" end) as $onit
   | (2 + ($label | length) + (if $bounded then $w + 1 else 0 end) + 1 + ($counts | length)
-     + 3 + ($meta | length) + (if $stalled then 3 + ($stalltxt | length) else 0 end)) as $used
-  | ($b.note // "" | gsub("[\\n\\r\\t]"; " ")) as $rawnote
+     + 3 + ($meta | length) + (if $stalled then 3 + ($stalltxt | length) else 0 end) + ($onit | length)) as $used
   | (if $cols > 0 then $cols - $used - 4 else 60 end) as $room
   | (if ($rawnote | length) == 0 or $room < 4 then ""
      elif ($rawnote | length) > $room then $rawnote[:$room - 1] + "…"
      else $rawnote end) as $note
   | ($icon | c($tone)) + " " + ($label | c("1"))
-    + (if $bounded then " " + gauge([$b.done / $b.total, 1] | min; $w) else "" end)
+    + (if $bounded then " " + gauge([$b.done / $b.total, 1] | min; $w; $fill) else "" end)
     + " " + $counts
-    + (" · " + $meta | c("2"))
+    + (" · " | c("2")) + ($meta | c("2"))
     + (if $stalled then (" · " | c("2")) + ($stalltxt | c("33")) else "" end)
-    + (if $note != "" then (" · " | c("2")) + $note else "" end);
+    + (if $note != "" then (" · " | c("2")) + $note + ($onit | c("33")) else "" end);
 now as $now
 | map(select(type == "object" and has("started_at")))
 # a bar that reached its total counts as finished even if `done` was never called
@@ -273,7 +299,9 @@ now as $now
     (.state == "running" and ($now - .updated_at) < $stalehide)
     or (.state != "running" and ($now - (.finished_at // .updated_at)) < $keep)))
 | sort_by(.started_at)
-| .[] | line($now)
+| (map(.label | length) | max // 0 | if . > 32 then 32 else . end) as $labelw
+| .[] | line($now; $labelw)
+
 '
 
 render_session() { # SID COLS COLOR

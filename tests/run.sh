@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Self-contained checks for cc-progress. Usage: tests/run.sh
 set -u
-P="$(cd "$(dirname "$0")/.." && pwd)/bin/cc-progress"
+P="${CC_PROGRESS_BIN:-$(cd "$(dirname "$0")/.." && pwd)/bin/cc-progress}"
 export CC_PROGRESS_DIR; CC_PROGRESS_DIR=$(mktemp -d)
 export CC_PROGRESS_SESSION=test COLUMNS=140 NO_COLOR=1
 trap 'rm -rf "$CC_PROGRESS_DIR"' EXIT
@@ -16,18 +16,24 @@ age() { jq -c "$1" "$F" > "$F.n" && mv "$F.n" "$F"; }
 check "fresh bar"            "$("$P" show)" "0/40 files 0%"
 check "no ETA before data"   "$("$P" show)" "ETA …"
 
-age '.started_at -= 60 | .samples = [[.started_at, 0]] | .done = 10 | .updated_at = now'
+age '.started_at -= 60 | .samples = [[.started_at, 0], [now, 10]] | .done = 10 | .updated_at = now'
 out=$("$P" show)
 check "count and percent"    "$out" "10/40 files 25%"
 check "elapsed"              "$out" "1m00s"
 check "eta = 30 left x 6s"   "$out" "ETA ~3m00s"
-check "average"              "$out" "avg 6s"
+check "average"              "$out" "6s/file"
 
-age '.started_at -= 4 | .samples[0][0] -= 4 | .updated_at -= 4'
+age '.started_at -= 4 | .samples[] |= (.[0] -= 4) | .updated_at -= 4'
 check "eta counts down between ticks" "$("$P" show)" "ETA ~2m56s"
 
-age '.started_at -= 26 | .samples[0][0] -= 26 | .updated_at -= 26'
-check "overrunning item floors eta at the rest" "$("$P" show)" "ETA ~2m54s"
+"$P" set 10 --note "same value"   # a heartbeat: must not move the ETA anchor
+check "same-value set keeps the countdown" "$("$P" show)" "ETA ~2m56s"
+
+age '.started_at -= 26 | .samples[] |= (.[0] -= 26)'
+out=$("$P" show)
+check "overdue item: eta is a floor" "$out" "ETA ≥"
+check "overdue item: in-flight time counted (10 in 90s, 29 left)" "$out" "ETA ≥4m21s"
+check "overdue item: time on the current item shown" "$out" "same value (30s)"
 
 age '.updated_at -= 600'
 check "stall is flagged"     "$("$P" show)" "no update for"
@@ -38,6 +44,13 @@ check "note shown"           "$("$P" show)" "file.pdf"
 
 "$P" total 15
 check "reaching total = done" "$("$P" show)" "✔ Converting"
+
+"$P" start --id pre --total 23 --label Catchup; "$P" set 19 --id pre
+check "work finished before start is shown" "$("$P" show | grep Catchup)" "19/23"
+check "...but gives no rate or ETA" "$("$P" show | grep Catchup)" "ETA …"
+check "...and becomes the baseline sample" "$(jq -c '.samples | length' "$CC_PROGRESS_DIR/test/pre.json")" "1"
+"$P" start --id pre2 --total 23 --done 19 --label Catchup2
+check "start --done" "$(jq -c '[.done, .samples[0][1]]' "$CC_PROGRESS_DIR/test/pre2.json")" "[19,19]"
 
 "$P" start --id free --label Scanning --unit rows; "$P" set 1200 --id free
 check "no total, no ETA"     "$("$P" show | grep Scanning)" "1200 rows"

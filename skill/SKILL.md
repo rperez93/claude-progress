@@ -70,7 +70,15 @@ cc-progress set "$pct" --note "epoch $e loss $loss"
   (`... && cc-progress tick --note "step 3: backfill"`), so it cannot be skipped.
 
 Steps of very unequal length make a poor ETA; say so rather than presenting the
-figure as reliable.
+figure as reliable. The bar itself marks the situation: `ETA ≥` with the time spent
+on the current item means that item is already past the average and the figure is
+a floor.
+
+**Work already partly done when the bar starts** — pass it as a baseline, so it
+is displayed but not counted into the rate: `cc-progress start --total 23 --done 19`.
+(A `set` right after `start` is treated the same way.) Only completions observed
+by the bar produce an ETA, which is why a bar started late over a mostly finished
+job honestly shows `ETA …` until the next item completes.
 
 ## 3. Always finish
 
@@ -81,13 +89,15 @@ automatically; one abandoned mid-way shows "no update for …" until cleared wit
 
 ## Several bars
 
-Name them: `--id download`, `--id build`. Each renders on its own row. Every
-command takes `--id`; the default is `main`.
+Name them: `--id download`, `--id build`. Each renders on its own row with the
+labels aligned, so give each a label that says what differs
+(`--label "Tests · main"` / `--label "Tests · v118"`). Every command takes `--id`;
+the default is `main`.
 
 ## Reference
 
 ```
-cc-progress start [--total N] [--label TEXT] [--unit WORD] [--note TEXT] [--tasks]
+cc-progress start [--total N] [--done N] [--label TEXT] [--unit WORD] [--note TEXT] [--tasks]
 cc-progress tick  [N] [--note TEXT]
 cc-progress set   DONE [--total N] [--note TEXT]
 cc-progress total N
@@ -100,8 +110,10 @@ cc-progress show            # print the bars as text — use it to check, or to 
 
 - Updating commands never break the job: on an operational error they warn on
   stderr and exit 0. If you see `no such bar`, the `start` was missed.
-- The ETA is `remaining ÷ recent rate`, over roughly the last 30 samples. It is
-  an estimate; the elapsed time next to it is a measurement.
+- The ETA is `remaining ÷ observed rate` over the last 30 completions, counted
+  down between updates; `≥` marks an overdue current item. It is an estimate; the
+  elapsed time next to it is a measurement. Re-`set`ting the same value is a
+  harmless heartbeat and does not disturb it.
 - Background jobs keep updating the bar after your turn ends — that is intended.
 - If the bar does not appear, run `cc-progress show`. Text there but nothing in
   the status line means the status line block is missing: re-run `install.sh`
