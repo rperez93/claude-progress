@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cc-progress"
-version = "0.5.0"
+version = "1.0.0"
 description = "Progress bars with count, elapsed time and ETA in the Claude Code status line."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Rafael Pérez" }]
 keywords = ["claude-code", "status-line", "progress-bar", "eta", "cli", "coding-agents"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
