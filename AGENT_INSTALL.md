@@ -23,8 +23,11 @@ pipx install cc-progress        # or: uv tool install cc-progress
 cc-progress install
 ```
 
-**Install from source only if the user is working on cc-progress itself**, or asked
-for an unreleased revision:
+If pipx reports that no matching distribution was found, the package is not on PyPI
+yet: install from source instead, exactly as below, and carry on with step 2.
+
+**Install from source otherwise only if the user is working on cc-progress itself**, or
+asked for an unreleased revision:
 
 ```bash
 git clone https://github.com/rperez93/claude-progress.git
