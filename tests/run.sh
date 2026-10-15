@@ -116,6 +116,9 @@ echo '{"hook_event_name":"TaskCompleted","task_id":"9"}' | "$P" hook
 check "TaskCompleted counted"  "$("$P" show | grep Plan)" "2/4"
 echo '{"hook_event_name":"TaskCompleted","task_id":"9"}' | "$P" hook
 check "TaskCompleted idempotent" "$("$P" show | grep Plan)" "2/4"
+echo '{"hook_event_name":"TaskCreated","task_id":"10","task_subject":"event first"}' | "$P" hook
+echo '{"hook_event_name":"PostToolUse","tool_name":"TaskCreate","tool_input":{"subject":"event first"},"tool_response":{"task":{"id":"10","subject":"event first"}}}' | "$P" hook
+check "TaskCreated before TaskCreate counts once" "$("$P" show | grep Plan)" "2/5"
 echo '{"hook_event_name":"SessionEnd"}' | "$P" hook
 check "session end cleans up" "$(ls "$CC_PROGRESS_DIR")" ""
 

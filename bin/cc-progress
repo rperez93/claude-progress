@@ -482,9 +482,12 @@ cmd_hook() {
           | .note = (($td | map(select(.status == "in_progress")) | .[0] | (.activeForm // .content)) // .note)
           | bump($td | map(select(.status == "completed")) | length)
         elif $t == "TaskCreate" then
-          .tasks.created += 1
-          | (if ($h.tool_response.task.id? != null) and ($i.subject != null)
-             then .tasks.subjects[$h.tool_response.task.id | tostring] = $i.subject else . end)
+          ($h.tool_response.task.id? // null | if . == null then null else tostring end) as $k
+          # the TaskCreated event may have counted this task already
+          | if $k != null and (.tasks.subjects[$k] != null) then . else
+              .tasks.created += 1
+              | (if $k != null then .tasks.subjects[$k] = ($i.subject // "task \($k)") else . end)
+            end
           | retotal | .updated_at = now
         elif $t == "TaskUpdate" and ($i.taskId != null) then
           ($i.taskId | tostring) as $k
